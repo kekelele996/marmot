@@ -9,10 +9,12 @@ import (
 	"reflect"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/maxpert/marmot/auth"
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/hlc"
@@ -227,6 +229,9 @@ type CoordinatorHandler struct {
 	schemaVersionMgr SchemaVersionManager
 	nodeRegistry     NodeRegistry
 	metadata         *handlers.MetadataHandler
+	// authMgr holds the configured MySQL client accounts and enforces
+	// per-connection database grants. Nil (or disabled) means open access.
+	authMgr *auth.Manager
 	// narrowIDs mints ids for AUTO_INCREMENT columns declared narrower than
 	// BIGINT, from ranges this node claims through writeCoord. Nil when the
 	// handler has no write coordinator to claim through.
@@ -320,6 +325,120 @@ func (h *CoordinatorHandler) SetDraining(d bool) {
 	h.draining.Store(d)
 }
 
+// SetAuthManager installs the account/grant manager used to authenticate and
+// authorize MySQL connections. Safe to call once at startup before serving.
+func (h *CoordinatorHandler) SetAuthManager(m *auth.Manager) {
+	h.authMgr = m
+}
+
+// authEnabled reports whether per-connection grants are enforced.
+func (h *CoordinatorHandler) authEnabled() bool {
+	return h.authMgr != nil && h.authMgr.Enabled()
+}
+
+// principal returns the authenticated user name and host for denial
+// messages, falling back to the handshake user name / raw remote address in
+// open mode.
+func principal(session *protocol.ConnectionSession) (string, string) {
+	if session.Identity != nil {
+		return session.Identity.Name, session.Identity.Host
+	}
+	return session.Username, session.RemoteAddr
+}
+
+// schemaVisibility returns the database-visibility predicate for a session,
+// or nil in open mode (metadata handlers then apply only their default
+// rules).
+func (h *CoordinatorHandler) schemaVisibility(session *protocol.ConnectionSession) func(string) bool {
+	if !h.authEnabled() || session.Identity == nil {
+		return nil
+	}
+	return session.Identity.CanAccess
+}
+
+// authorize enforces a statement's database grant. It must be called after
+// the statement's target database is resolved (explicit qualifier or session
+// default). Statements with no target database skip the check and fail later
+// with the usual "no database selected" errors.
+func (h *CoordinatorHandler) authorize(session *protocol.ConnectionSession, stmt *protocol.Statement) error {
+	if !h.authEnabled() || stmt.Database == "" {
+		return nil
+	}
+	return h.authMgr.Authorize(
+		session.Identity,
+		stmt.Database,
+		statementCommand(stmt),
+		stmt.TableName,
+		protocol.IsMutation(*stmt),
+	)
+}
+
+// AuthorizeDatabase implements protocol.DatabaseAuthorizer for the handshake
+// CONNECT_WITH_DB and COM_INIT_DB paths: the database must exist and the
+// account must hold a grant on it.
+func (h *CoordinatorHandler) AuthorizeDatabase(session *protocol.ConnectionSession, database string) error {
+	if h.dbManager != nil && !h.dbManager.DatabaseExists(database) {
+		return protocol.NewMySQLError(
+			protocol.ErrCodeBadDB,
+			protocol.SQLStateSyntax,
+			fmt.Sprintf("Unknown database '%s'", database),
+		)
+	}
+	if !h.authEnabled() {
+		return nil
+	}
+	return h.authMgr.Authorize(session.Identity, database, "USE", "", false)
+}
+
+// authorizeRead enforces read access to a resolved database for SHOW
+// commands and other metadata reads.
+func (h *CoordinatorHandler) authorizeRead(session *protocol.ConnectionSession, database string) error {
+	if !h.authEnabled() || database == "" {
+		return nil
+	}
+	return h.authMgr.Authorize(session.Identity, database, "SHOW", "", false)
+}
+
+// statementCommand returns the MySQL command verb used in 1142 denial
+// messages.
+func statementCommand(stmt *protocol.Statement) string {
+	switch stmt.Type {
+	case protocol.StatementSelect:
+		return "SELECT"
+	case protocol.StatementInsert:
+		return "INSERT"
+	case protocol.StatementReplace:
+		return "REPLACE"
+	case protocol.StatementUpdate:
+		return "UPDATE"
+	case protocol.StatementDelete:
+		return "DELETE"
+	case protocol.StatementLoadData:
+		return "LOAD"
+	case protocol.StatementCreateDatabase, protocol.StatementDropDatabase,
+		protocol.StatementDDL, protocol.StatementCreateVectorIndex,
+		protocol.StatementDropVectorIndex, protocol.StatementReindexVectorIndex:
+		return ddlCommandVerb(stmt.SQL)
+	case protocol.StatementDCL:
+		return "GRANT"
+	case protocol.StatementAdmin:
+		return "ADMIN"
+	default:
+		return "COMMAND"
+	}
+}
+
+// ddlCommandVerb extracts the leading CREATE/ALTER/DROP keyword for denial
+// messages, falling back to "CREATE" when the text is unexpected.
+func ddlCommandVerb(sql string) string {
+	for _, verb := range []string{"CREATE", "ALTER", "DROP", "REINDEX"} {
+		if strings.HasPrefix(strings.TrimSpace(strings.ToUpper(sql)), verb) {
+			return verb
+		}
+	}
+	return "CREATE"
+}
+
 // IsDraining reports whether the handler is currently rejecting new writes.
 func (h *CoordinatorHandler) IsDraining() bool {
 	return h.draining.Load()
@@ -404,8 +523,14 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 		return h.handleSystemQuery(session, stmt)
 	}
 
-	// Handle virtual table queries (MARMOT_CLUSTER_NODES, etc.)
+	// Handle virtual table queries (MARMOT_CLUSTER_NODES, etc.). These expose
+	// cluster topology and are restricted to wildcard (admin) accounts once
+	// authentication is enabled.
 	if stmt.Type == protocol.StatementVirtualTable {
+		if h.authEnabled() && (session.Identity == nil || !session.Identity.IsAdmin()) {
+			name, host := principal(session)
+			return nil, auth.CommandDeniedError(name, host, "SELECT", stmt.TableName)
+		}
 		return h.handleVirtualTableQuery(session, stmt)
 	}
 
@@ -440,17 +565,24 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 	// Handle database management commands
 	switch stmt.Type {
 	case protocol.StatementShowDatabases:
-		return h.handleShowDatabases()
+		return h.handleShowDatabases(session)
 	case protocol.StatementUseDatabase:
+		if err := h.AuthorizeDatabase(session, stmt.Database); err != nil {
+			return nil, err
+		}
 		return h.handleUseDatabase(session, stmt.Database)
 	}
 
-	// Handle metadata queries (for DBeaver compatibility)
+	// Handle metadata queries (for DBeaver compatibility). Every SHOW targets
+	// a database the account must be able to see.
 	switch stmt.Type {
 	case protocol.StatementShowTables:
 		dbName := stmt.Database
 		if dbName == "" {
 			dbName = session.CurrentDatabase
+		}
+		if err := h.authorizeRead(session, dbName); err != nil {
+			return nil, err
 		}
 		return h.metadata.HandleShowTables(dbName, stmt.ShowFilter)
 	case protocol.StatementShowColumns:
@@ -458,11 +590,17 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 		if dbName == "" {
 			dbName = session.CurrentDatabase
 		}
+		if err := h.authorizeRead(session, dbName); err != nil {
+			return nil, err
+		}
 		return h.metadata.HandleShowColumns(dbName, stmt.TableName)
 	case protocol.StatementShowCreateTable:
 		dbName := stmt.Database
 		if dbName == "" {
 			dbName = session.CurrentDatabase
+		}
+		if err := h.authorizeRead(session, dbName); err != nil {
+			return nil, err
 		}
 		return h.metadata.HandleShowCreateTable(dbName, stmt.TableName)
 	case protocol.StatementShowIndexes:
@@ -470,22 +608,36 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 		if dbName == "" {
 			dbName = session.CurrentDatabase
 		}
+		if err := h.authorizeRead(session, dbName); err != nil {
+			return nil, err
+		}
 		return h.metadata.HandleShowIndexes(dbName, stmt.TableName)
 	case protocol.StatementShowTableStatus:
 		dbName := stmt.Database
 		if dbName == "" {
 			dbName = session.CurrentDatabase
 		}
+		if err := h.authorizeRead(session, dbName); err != nil {
+			return nil, err
+		}
 		return h.metadata.HandleShowTableStatus(dbName, stmt.TableName)
 	case protocol.StatementShowEngines:
 		return h.handleShowEngines()
 	case protocol.StatementInformationSchema:
-		return h.metadata.HandleInformationSchema(session.CurrentDatabase, stmt)
+		// Granted schemas only: unauthorized databases answer as absent.
+		return h.metadata.HandleInformationSchema(session.CurrentDatabase, stmt, h.schemaVisibility(session))
 	}
 
 	// Set database context from session if not specified in statement
 	if stmt.Database == "" {
 		stmt.Database = session.CurrentDatabase
+	}
+
+	// Enforce the account's grant before the statement touches any data.
+	// CREATE/DROP DATABASE carry their target name in stmt.Database; table
+	// statements carry the qualifier or fall back to the session database.
+	if err := h.authorize(session, &stmt); err != nil {
+		return nil, err
 	}
 
 	isMutation := protocol.IsMutation(stmt)
@@ -602,6 +754,12 @@ func (h *CoordinatorHandler) HandleLoadData(session *protocol.ConnectionSession,
 		database = session.CurrentDatabase
 	}
 	stmt.Database = database
+
+	// The account must be allowed to write the target database/table before
+	// the upload is accepted or replicated.
+	if err := h.authMgr.Authorize(session.Identity, database, "LOAD", table, true); err != nil {
+		return nil, err
+	}
 
 	// A table with a narrow AUTO_INCREMENT column takes its rows as ordinary
 	// INSERTs through this handler, so their ids are generated or admitted

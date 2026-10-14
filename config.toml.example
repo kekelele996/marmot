@@ -306,6 +306,46 @@ local_infile_enabled = true
 # "extended" = 64-bit HLC-based IDs for maximum uniqueness
 auto_id_mode = "compact"
 
+# Client accounts. When at least one [[mysql.users]] entry is present every
+# MySQL connection must authenticate with its own account (MySQL native
+# password), and can only use the databases granted to that account. With no
+# entries configured the server is open to everyone (backward compatible) and
+# prints a warning at startup.
+#
+# Fields:
+#   name          login name
+#   password      plaintext password (development convenience)
+#   password_hash MySQL PASSWORD() digest: "*" + 40 uppercase hex chars of
+#                 SHA1(SHA1(password)); preferred for production. Generate
+#                 with MySQL:  SELECT PASSWORD('your-password');
+#                 or shell:
+#   printf '*%s' "$(printf %s 'your-password' | sha1sum | cut -d' ' -f1 \
+#     | tr -d '\n' | while read h; do printf %s "$h" | sha1sum; done \
+#     | cut -d' ' -f1 | tr a-f A-F)"
+#   databases     grant list: exact names, glob patterns such as "app_*", or
+#                 ["*"] for every user database. The internal
+#                 __marmot_system database is never grantable.
+#   read_only     true = SELECT/SHOW only on granted databases (default false)
+#
+# Example: one read-write application account scoped to its database, one
+# read-only reporting account, and an administrator.
+
+# [[mysql.users]]
+# name = "billing_app"
+# password_hash = "*ECED02AA5999F85A2F6CF41CAAC701CF47C59FAF"  # SHA1(SHA1("billing-pw"))
+# databases = ["billing"]
+#
+# [[mysql.users]]
+# name = "reporting"
+# password = "change-me"
+# databases = ["billing", "shared"]
+# read_only = true
+#
+# [[mysql.users]]
+# name = "admin"
+# password_hash = "*448FD81F8FD4580E7BB0C985C95126461ED219C8"  # SHA1(SHA1("admin-pw"))
+# databases = ["*"]
+
 # ==============================================================================
 # SNAPSHOT (Streaming recovery for new/lagging nodes)
 # ==============================================================================

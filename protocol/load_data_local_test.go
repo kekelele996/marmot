@@ -237,7 +237,7 @@ func TestHandshakeAdvertisesLocalInfileCapability(t *testing.T) {
 	defer serverConn.Close()
 
 	go func() {
-		_ = server.writeHandshake(serverConn)
+		_ = sendTestHandshake(server, serverConn)
 	}()
 
 	payload := mustReadPacket(t, clientConn)
@@ -292,7 +292,7 @@ func TestHandshakeOmitsLocalInfileCapabilityWhenDisabled(t *testing.T) {
 	defer serverConn.Close()
 
 	go func() {
-		_ = server.writeHandshake(serverConn)
+		_ = sendTestHandshake(server, serverConn)
 	}()
 
 	payload := mustReadPacket(t, clientConn)

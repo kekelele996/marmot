@@ -38,11 +38,16 @@ func NewMetadataHandler(db DatabaseProvider, systemDatabaseName string) *Metadat
 	}
 }
 
-// HandleShowDatabases returns list of databases
-func (m *MetadataHandler) HandleShowDatabases() (*protocol.ResultSet, error) {
+// HandleShowDatabases returns list of databases. visible optionally limits
+// the list to databases the connected account is granted; nil lists every
+// existing database (open mode).
+func (m *MetadataHandler) HandleShowDatabases(visible func(string) bool) (*protocol.ResultSet, error) {
 	dbs := m.db.ListDatabases()
 	rows := make([][]interface{}, 0, len(dbs))
 	for _, dbName := range dbs {
+		if visible != nil && !visible(dbName) {
+			continue
+		}
 		rows = append(rows, []interface{}{dbName})
 	}
 

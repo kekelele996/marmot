@@ -8,8 +8,11 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// HandleInformationSchema handles INFORMATION_SCHEMA queries using pre-parsed filter values
-func (m *MetadataHandler) HandleInformationSchema(currentDB string, stmt protocol.Statement) (*protocol.ResultSet, error) {
+// HandleInformationSchema handles INFORMATION_SCHEMA queries using pre-parsed filter values.
+// visible optionally reports which databases the connected account may see; a
+// schema it cannot see answers as if it did not exist (no rows), exactly as
+// MySQL answers INFORMATION_SCHEMA for a schema without a grant.
+func (m *MetadataHandler) HandleInformationSchema(currentDB string, stmt protocol.Statement, visible func(string) bool) (*protocol.ResultSet, error) {
 	log.Debug().
 		Int("is_table_type", int(stmt.ISTableType)).
 		Str("filter_schema", stmt.ISFilter.SchemaName).
@@ -23,13 +26,13 @@ func (m *MetadataHandler) HandleInformationSchema(currentDB string, stmt protoco
 	// Route based on pre-parsed table type (no string matching needed)
 	switch stmt.ISTableType {
 	case protocol.ISTableTables:
-		rows, err = m.informationSchemaTables(currentDB, stmt.ISFilter)
+		rows, err = m.informationSchemaTables(currentDB, stmt.ISFilter, visible)
 	case protocol.ISTableColumns:
-		rows, err = m.informationSchemaColumns(currentDB, stmt.ISFilter)
+		rows, err = m.informationSchemaColumns(currentDB, stmt.ISFilter, visible)
 	case protocol.ISTableSchemata:
-		rows = m.informationSchemaSchemata(stmt.ISFilter)
+		rows = m.informationSchemaSchemata(stmt.ISFilter, visible)
 	case protocol.ISTableStatistics:
-		rows, err = m.informationSchemaStatistics(currentDB, stmt.ISFilter)
+		rows, err = m.informationSchemaStatistics(currentDB, stmt.ISFilter, visible)
 	default:
 		// Unsupported INFORMATION_SCHEMA table - return empty result
 		return &protocol.ResultSet{
@@ -50,16 +53,20 @@ func (m *MetadataHandler) HandleInformationSchema(currentDB string, stmt protoco
 }
 
 // visibleDatabase reports whether a client may see name in
-// INFORMATION_SCHEMA: it exists and is not Marmot's system database. A schema
+// INFORMATION_SCHEMA: it exists, is not Marmot's system database, and - when
+// the connection is authenticated - is among the account's grants. A schema
 // a client cannot see has no tables, exactly as MySQL answers for one that
 // does not exist.
-func (m *MetadataHandler) visibleDatabase(name string) bool {
-	return name != "" && name != m.systemDatabaseName && m.db.DatabaseExists(name)
+func (m *MetadataHandler) visibleDatabase(name string, granted func(string) bool) bool {
+	if name == "" || name == m.systemDatabaseName || !m.db.DatabaseExists(name) {
+		return false
+	}
+	return granted == nil || granted(name)
 }
 
 // informationSchemaTables answers INFORMATION_SCHEMA.TABLES: every table of
 // the filtered schema (else the session's, else every schema).
-func (m *MetadataHandler) informationSchemaTables(currentDB string, filter protocol.InformationSchemaFilter) ([][]interface{}, error) {
+func (m *MetadataHandler) informationSchemaTables(currentDB string, filter protocol.InformationSchemaFilter, granted func(string) bool) ([][]interface{}, error) {
 	dbName := filter.SchemaName
 	if dbName == "" {
 		dbName = currentDB
@@ -72,7 +79,7 @@ func (m *MetadataHandler) informationSchemaTables(currentDB string, filter proto
 
 	var rows [][]interface{}
 	for _, schema := range schemas {
-		if !m.visibleDatabase(schema) {
+		if !m.visibleDatabase(schema, granted) {
 			continue
 		}
 		tables, err := m.userTables(schema, filter.TableName)
@@ -116,7 +123,7 @@ func informationSchemaTablesRow(schema, tableName string) []interface{} {
 
 // informationSchemaColumns answers INFORMATION_SCHEMA.COLUMNS for the
 // filtered table, or for every table of the schema.
-func (m *MetadataHandler) informationSchemaColumns(currentDB string, filter protocol.InformationSchemaFilter) ([][]interface{}, error) {
+func (m *MetadataHandler) informationSchemaColumns(currentDB string, filter protocol.InformationSchemaFilter, granted func(string) bool) ([][]interface{}, error) {
 	dbName := filter.SchemaName
 	if dbName == "" {
 		dbName = currentDB
@@ -124,7 +131,7 @@ func (m *MetadataHandler) informationSchemaColumns(currentDB string, filter prot
 	if dbName == "" {
 		return nil, fmt.Errorf("no database specified")
 	}
-	if !m.visibleDatabase(dbName) {
+	if !m.visibleDatabase(dbName, granted) {
 		return nil, nil
 	}
 
@@ -151,10 +158,13 @@ func (m *MetadataHandler) informationSchemaColumns(currentDB string, filter prot
 }
 
 // informationSchemaSchemata answers INFORMATION_SCHEMA.SCHEMATA.
-func (m *MetadataHandler) informationSchemaSchemata(filter protocol.InformationSchemaFilter) [][]interface{} {
+func (m *MetadataHandler) informationSchemaSchemata(filter protocol.InformationSchemaFilter, granted func(string) bool) [][]interface{} {
 	var rows [][]interface{}
 	for _, dbName := range m.db.ListDatabases() {
 		if dbName == m.systemDatabaseName {
+			continue
+		}
+		if granted != nil && !granted(dbName) {
 			continue
 		}
 		if filter.SchemaName != "" && dbName != filter.SchemaName {
@@ -173,12 +183,12 @@ func (m *MetadataHandler) informationSchemaSchemata(filter protocol.InformationS
 
 // informationSchemaStatistics answers INFORMATION_SCHEMA.STATISTICS for the
 // filtered table; without a table it answers no rows.
-func (m *MetadataHandler) informationSchemaStatistics(currentDB string, filter protocol.InformationSchemaFilter) ([][]interface{}, error) {
+func (m *MetadataHandler) informationSchemaStatistics(currentDB string, filter protocol.InformationSchemaFilter, granted func(string) bool) ([][]interface{}, error) {
 	dbName := filter.SchemaName
 	if dbName == "" {
 		dbName = currentDB
 	}
-	if filter.TableName == "" || !m.visibleDatabase(dbName) {
+	if filter.TableName == "" || !m.visibleDatabase(dbName, granted) {
 		return nil, nil
 	}
 

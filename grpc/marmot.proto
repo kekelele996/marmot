@@ -591,6 +591,7 @@ message ForwardQueryRequest {
   bool wait_for_replication = 6; // Block until replicated back
   repeated bytes params = 7;     // Prepared statement params (msgpack encoded)
   uint32 timeout_ms = 8;         // Client-specified timeout in milliseconds
+  string username = 10;          // Authenticated client account, for leader-side authorization
 }
 
 message ForwardQueryResponse {
@@ -622,6 +623,7 @@ message ForwardLoadDataRequest {
   bytes data = 6;
   bool wait_for_replication = 7;
   uint32 timeout_ms = 8;
+  string username = 9; // Authenticated client account, for leader-side authorization
 }
 
 message LoadDataChunkRequest {

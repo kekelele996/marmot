@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/maxpert/marmot/auth"
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/hlc"
@@ -104,8 +105,9 @@ func (r *Replica) SetConnected(connected bool) {
 	r.connected.Store(connected)
 }
 
-// Run starts the read-only replica and blocks until shutdown
-func Run() {
+// Run starts the read-only replica and blocks until shutdown. authMgr holds
+// the MySQL client accounts shared with the main server configuration.
+func Run(authMgr *auth.Manager) {
 	log.Debug().Msg("Initializing telemetry")
 	telemetry.InitializeTelemetry()
 	telemetry.InitMetrics()
@@ -173,6 +175,7 @@ func Run() {
 
 	// Initialize read-only handler
 	replica.handler = NewReadOnlyHandler(dbMgr, replica.clock, replica)
+	replica.handler.SetAuthManager(authMgr)
 
 	// Initialize query pipeline (no ID generators - replicas are read-only)
 	if err := protocol.InitializePipeline(
@@ -196,6 +199,7 @@ func Run() {
 		replica.handler,
 	)
 	mysqlServer.SetLocalInfileEnabled(cfg.Config.MySQL.LocalInfile)
+	mysqlServer.SetAuthenticator(authMgr)
 
 	if err := mysqlServer.Start(); err != nil {
 		log.Fatal().Err(err).Msg("Failed to start MySQL server")

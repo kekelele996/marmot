@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/maxpert/marmot/admin"
+	"github.com/maxpert/marmot/auth"
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/coordinator"
@@ -117,6 +118,19 @@ func main() {
 		log.Logger = gLog.Level(zerolog.InfoLevel)
 	}
 
+	// Build the MySQL client account manager once; both cluster and replica
+	// modes share it. With no accounts configured the server stays open
+	// (backward compatible) but warns loudly.
+	authMgr, err := auth.NewManager(cfg.Config.MySQL.Users)
+	if err != nil {
+		panic(fmt.Sprintf("Invalid MySQL user configuration: %v", err))
+	}
+	if cfg.Config.MySQL.Enabled && !authMgr.Enabled() {
+		log.Warn().Msg("WARNING: MySQL client authentication is disabled - any connection has full access. Configure [[mysql.users]] accounts for production use.")
+	} else if authMgr.Enabled() {
+		log.Info().Strs("users", authMgr.AccountNames()).Msg("MySQL client authentication enabled")
+	}
+
 	// Branch based on operating mode
 	if cfg.IsReplicaMode() {
 		log.Info().Msg("Marmot v2.10.0-beta - Read-Only Replica Mode")
@@ -130,7 +144,7 @@ func main() {
 		}
 
 		// Run replica mode (does not return until shutdown)
-		replica.Run()
+		replica.Run(authMgr)
 		return
 	}
 
@@ -497,6 +511,7 @@ func main() {
 		registryAdapter,
 	)
 	handler.SetVectorEngine(vecEngine)
+	handler.SetAuthManager(authMgr)
 	dbMgr.SetAutoIncIncarnationListener(handler)
 
 	// Initialize write forwarding for read-only replicas
@@ -508,6 +523,7 @@ func main() {
 		handler,
 		dbMgr,
 	)
+	forwardHandler.SetAuthManager(authMgr)
 	grpcServer.SetForwardSessionManager(forwardSessionMgr)
 	grpcServer.SetForwardHandler(forwardHandler)
 	log.Info().Msg("Write forwarding handler initialized for read-only replicas")
@@ -548,6 +564,7 @@ func main() {
 		handler,
 	)
 	mysqlServer.SetLocalInfileEnabled(cfg.Config.MySQL.LocalInfile)
+	mysqlServer.SetAuthenticator(authMgr)
 
 	if err := mysqlServer.Start(); err != nil {
 		log.Fatal().Err(err).Msg("Failed to start MySQL server")

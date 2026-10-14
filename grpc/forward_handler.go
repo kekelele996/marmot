@@ -5,9 +5,11 @@ import (
 	"database/sql"
 	"fmt"
 
+	"github.com/maxpert/marmot/auth"
 	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
+	"github.com/maxpert/marmot/protocol/mysqlcode"
 	"github.com/rs/zerolog/log"
 )
 
@@ -18,6 +20,35 @@ type ForwardHandler struct {
 	sessionMgr   *ForwardSessionManager
 	coordHandler *coordinator.CoordinatorHandler
 	dbManager    ForwardDBManager
+	authMgr      *auth.Manager
+}
+
+// SetAuthManager installs the account manager used to resolve the username a
+// replica attaches to each forwarded request. Without a resolvable account when
+// authentication is enabled, forwarded requests are refused on the leader
+// rather than running without grants.
+func (h *ForwardHandler) SetAuthManager(m *auth.Manager) {
+	h.authMgr = m
+}
+
+// resolveForwardIdentity resolves the client account behind a forwarded
+// request. In open mode it returns nil identity (no enforcement); with
+// authentication enabled, an unknown/empty username is a 1045 failure.
+func (h *ForwardHandler) resolveForwardIdentity(username string) (*auth.Identity, *ForwardQueryResponse) {
+	if h.authMgr == nil || !h.authMgr.Enabled() {
+		return nil, nil
+	}
+	identity := h.authMgr.IdentityFor(username, "replica-forward")
+	if identity == nil {
+		err := auth.AccessDeniedError(username, "replica-forward", username != "")
+		return nil, &ForwardQueryResponse{
+			Success:      false,
+			ErrorMessage: err.Message,
+			ErrorCode:    uint32(mysqlcode.ErrCodeAccessDenied),
+			SqlState:     mysqlcode.SQLStateAccessDenied,
+		}
+	}
+	return identity, nil
 }
 
 // ForwardDBManager interface for database operations
@@ -88,11 +119,16 @@ func (h *ForwardHandler) HandleForwardQuery(ctx context.Context, req *ForwardQue
 		}, nil
 	}
 
+	identity, denied := h.resolveForwardIdentity(req.Username)
+	if denied != nil {
+		return denied, nil
+	}
+
 	key := ForwardSessionKey{
 		ReplicaNodeID: req.ReplicaNodeId,
 		SessionID:     req.SessionId,
 	}
-	session := h.sessionMgr.GetOrCreateSession(key, req.Database)
+	session := h.sessionMgr.GetOrCreateSession(key, req.Database, identity)
 	session.Touch()
 
 	// Handle transaction control first.
@@ -180,6 +216,11 @@ func (h *ForwardHandler) HandleForwardLoadData(ctx context.Context, req *Forward
 		}, nil
 	}
 
+	identity, denied := h.resolveForwardIdentity(req.Username)
+	if denied != nil {
+		return denied, nil
+	}
+
 	stmt := protocol.ParseStatement(req.Sql)
 	if stmt.Type != protocol.StatementLoadData {
 		return &ForwardQueryResponse{
@@ -192,7 +233,7 @@ func (h *ForwardHandler) HandleForwardLoadData(ctx context.Context, req *Forward
 		ReplicaNodeID: req.ReplicaNodeId,
 		SessionID:     req.SessionId,
 	}
-	session := h.sessionMgr.GetOrCreateSession(key, req.Database)
+	session := h.sessionMgr.GetOrCreateSession(key, req.Database, identity)
 	session.Touch()
 
 	return h.executeIdempotentLoad(ctx, session, req, func(connSession *protocol.ConnectionSession) *ForwardQueryResponse {

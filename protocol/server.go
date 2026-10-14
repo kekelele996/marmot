@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/maxpert/marmot/auth"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/modules/vecindex"
 	"github.com/maxpert/marmot/protocol/query"
@@ -51,10 +52,28 @@ type MySQLServer struct {
 	wg             sync.WaitGroup // tracks accept-loop goroutines
 	connWg         sync.WaitGroup // tracks per-connection goroutines
 	handler        ConnectionHandler
+	authenticator  Authenticator
 	connIDGen      uint64
 	connIDLock     sync.Mutex
 	activeConns    *xsync.MapOf[uint64, net.Conn]
 	draining       atomic.Bool
+}
+
+// Authenticator validates a client's mysql_native_password handshake.
+// Enabled reports whether authentication must be enforced; when it returns
+// false the server accepts every connection (open/backward-compatible mode).
+// *auth.Manager implements this interface.
+type Authenticator interface {
+	Enabled() bool
+	Authenticate(username string, authResponse, salt []byte, remoteAddr string) (*auth.Identity, error)
+}
+
+// DatabaseAuthorizer is an optional ConnectionHandler extension that decides
+// whether a connection may enter a database (handshake CONNECT_WITH_DB and
+// COM_INIT_DB). Handlers enforce both database existence and the account's
+// grant, returning a *MySQLError (or an auth.Error) on refusal.
+type DatabaseAuthorizer interface {
+	AuthorizeDatabase(session *ConnectionSession, database string) error
 }
 
 // SessionTransaction holds transaction state for explicit BEGIN/COMMIT
@@ -74,10 +93,18 @@ type SessionTransaction struct {
 
 // ConnectionSession represents per-connection state
 type ConnectionSession struct {
-	ConnID           uint64
-	CurrentDatabase  string
-	RemoteAddr       string
-	ClientCaps       uint32
+	ConnID          uint64
+	CurrentDatabase string
+	RemoteAddr      string
+	ClientCaps      uint32
+
+	// Username is the login name presented in the handshake, recorded even
+	// when authentication is disabled.
+	Username string
+	// Identity is the authenticated account, nil in open mode (no accounts
+	// configured). Every privilege decision goes through it.
+	Identity *auth.Identity
+
 	preparedStmts    map[uint32]*PreparedStatement
 	preparedStmtLock sync.Mutex
 	nextStmtID       uint32
@@ -269,6 +296,13 @@ func (s *MySQLServer) SetLocalInfileEnabled(enabled bool) {
 	s.localInfile = enabled
 }
 
+// SetAuthenticator installs the connection authenticator. With an
+// authenticator whose Enabled() is true, every handshake must present valid
+// account credentials before the client can issue any command.
+func (s *MySQLServer) SetAuthenticator(a Authenticator) {
+	s.authenticator = a
+}
+
 // Start starts the MySQL server
 func (s *MySQLServer) Start() error {
 	// Create TCP listener (always)
@@ -420,10 +454,20 @@ func (s *MySQLServer) acceptLoop(listener net.Listener) {
 func (s *MySQLServer) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
-	// Create session for this connection
+	authRequired := s.authenticator != nil && s.authenticator.Enabled()
+
+	// Create session for this connection.
+	// With authentication enforced the session starts with no current
+	// database: one is selected only after the handshake-supplied database
+	// passes the account's grant check. In open mode the historical default
+	// ("marmot") is preserved.
+	initialDatabase := ""
+	if !authRequired {
+		initialDatabase = "marmot"
+	}
 	session := &ConnectionSession{
 		ConnID:               s.nextConnID(),
-		CurrentDatabase:      "marmot", // Default database
+		CurrentDatabase:      initialDatabase,
 		RemoteAddr:           conn.RemoteAddr().String(),
 		preparedStmts:        make(map[uint32]*PreparedStatement),
 		nextStmtID:           1,
@@ -446,8 +490,9 @@ func (s *MySQLServer) handleConnection(conn net.Conn) {
 
 	log.Debug().Uint64("conn_id", session.ConnID).Str("remote", session.RemoteAddr).Msg("New connection")
 
-	// 1. Send Initial Handshake Packet
-	if err := s.writeHandshake(conn); err != nil {
+	// 1. Send Initial Handshake Packet (with a fresh per-connection salt)
+	salt := auth.GenerateSalt()
+	if err := s.writeHandshake(conn, session, salt[:]); err != nil {
 		log.Error().Err(err).Msg("Failed to write handshake")
 		return
 	}
@@ -460,18 +505,60 @@ func (s *MySQLServer) handleConnection(conn net.Conn) {
 	}
 
 	// Parse handshake response to extract database name and other info
-	if handshake, err := ParseHandshakeResponse(handshakeResp); err == nil {
+	var handshake *HandshakeInfo
+	if parsed, parseErr := ParseHandshakeResponse(handshakeResp); parseErr == nil {
+		handshake = parsed
 		session.ClientCaps = handshake.Capabilities
-		if handshake.Database != "" {
-			session.CurrentDatabase = handshake.Database
-			log.Debug().
-				Uint64("conn_id", session.ConnID).
-				Str("database", handshake.Database).
-				Str("user", handshake.Username).
-				Msg("Initial database from handshake")
-		}
+		session.Username = handshake.Username
 	} else {
-		log.Warn().Err(err).Uint64("conn_id", session.ConnID).Msg("Failed to parse handshake response")
+		log.Warn().Err(parseErr).Uint64("conn_id", session.ConnID).Msg("Failed to parse handshake response")
+	}
+
+	// 2b. Authenticate the account before anything else is acknowledged.
+	if authRequired {
+		if handshake == nil {
+			_ = s.writeMySQLErr(conn, 2, auth.AccessDeniedError("", session.RemoteAddr, false))
+			return
+		}
+		identity, authErr := s.authenticator.Authenticate(
+			handshake.Username,
+			handshake.AuthResponse,
+			salt[:],
+			session.RemoteAddr,
+		)
+		if authErr != nil {
+			log.Info().
+				Uint64("conn_id", session.ConnID).
+				Str("user", handshake.Username).
+				Str("remote", session.RemoteAddr).
+				Msg("MySQL connection authentication failed")
+			_ = s.writeMySQLErr(conn, 2, authErr)
+			return
+		}
+		session.Identity = identity
+		log.Debug().
+			Uint64("conn_id", session.ConnID).
+			Str("user", identity.Name).
+			Str("remote", session.RemoteAddr).
+			Msg("MySQL connection authenticated")
+	}
+
+	// 2c. Enter the database requested in the handshake once it exists and
+	// the account is allowed to use it. In open mode keep the historical
+	// permissive behavior of accepting whatever the client named.
+	if handshake != nil && handshake.Database != "" {
+		if authorizer, ok := s.handler.(DatabaseAuthorizer); ok {
+			if err := authorizer.AuthorizeDatabase(session, handshake.Database); err != nil {
+				_ = s.writeMySQLErr(conn, 2, err)
+				return
+			}
+		}
+		session.CurrentDatabase = handshake.Database
+		log.Debug().
+			Uint64("conn_id", session.ConnID).
+			Str("database", handshake.Database).
+			Str("user", handshake.Username).
+			Msg("Initial database from handshake")
 	}
 
 	// Reject new connections when the server is draining.
@@ -515,6 +602,12 @@ func (s *MySQLServer) handleConnection(conn net.Conn) {
 		switch cmd {
 		case 0x02: // COM_INIT_DB (USE database)
 			dbName := string(payload[1:])
+			if authorizer, ok := s.handler.(DatabaseAuthorizer); ok {
+				if err := authorizer.AuthorizeDatabase(session, dbName); err != nil {
+					_ = s.writeMySQLErr(conn, 1, err)
+					continue
+				}
+			}
 			session.CurrentDatabase = dbName
 			log.Debug().Uint64("conn_id", session.ConnID).Str("database", dbName).Msg("Changed database")
 			_ = s.writeOK(conn, 1, session, 0, 0)
@@ -588,9 +681,13 @@ func (s *MySQLServer) processQuery(conn net.Conn, session *ConnectionSession, qu
 
 // --- Packet Writing Helpers ---
 
-func (s *MySQLServer) writeHandshake(w io.Writer) error {
+func (s *MySQLServer) writeHandshake(w io.Writer, session *ConnectionSession, salt []byte) error {
 	// Basic handshake packet
 	// https://dev.mysql.com/doc/internals/en/connection-phase-packets.html#packet-Protocol::Handshake
+
+	if len(salt) < 20 {
+		return fmt.Errorf("auth salt must be at least 20 bytes, got %d", len(salt))
+	}
 
 	buf := getBuffer()
 	defer putBuffer(buf)
@@ -602,10 +699,10 @@ func (s *MySQLServer) writeHandshake(w io.Writer) error {
 	buf.WriteString("5.7.0-Marmot-V2\x00")
 
 	// Connection ID
-	_ = binary.Write(buf, binary.LittleEndian, uint32(1))
+	_ = binary.Write(buf, binary.LittleEndian, uint32(session.ConnID))
 
 	// Auth plugin data part 1 (8 bytes)
-	buf.WriteString("12345678")
+	buf.Write(salt[:8])
 
 	// Filler
 	buf.WriteByte(0)
@@ -636,8 +733,9 @@ func (s *MySQLServer) writeHandshake(w io.Writer) error {
 	// Reserved (10 bytes)
 	buf.Write([]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0})
 
-	// Auth plugin data part 2 (13 bytes)
-	buf.WriteString("123456789012\x00")
+	// Auth plugin data part 2 (12 bytes + null terminator)
+	buf.Write(salt[8:20])
+	buf.WriteByte(0)
 
 	// Auth plugin name
 	buf.WriteString("mysql_native_password\x00")

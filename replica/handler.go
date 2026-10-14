@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/maxpert/marmot/auth"
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/db"
 	marmotgrpc "github.com/maxpert/marmot/grpc"
@@ -28,6 +29,84 @@ type ReadOnlyHandler struct {
 	metadata       *handlers.MetadataHandler
 	forwardWrites  bool
 	forwardTimeout time.Duration
+	authMgr        *auth.Manager
+}
+
+// SetAuthManager installs the account/grant manager shared with the MySQL
+// server, so replica connections enforce the same grants as cluster nodes.
+func (h *ReadOnlyHandler) SetAuthManager(m *auth.Manager) {
+	h.authMgr = m
+}
+
+// authEnabled reports whether per-connection grants are enforced.
+func (h *ReadOnlyHandler) authEnabled() bool {
+	return h.authMgr != nil && h.authMgr.Enabled()
+}
+
+// schemaVisibility returns the account's database-visibility predicate, or
+// nil in open mode.
+func (h *ReadOnlyHandler) schemaVisibility(session *protocol.ConnectionSession) func(string) bool {
+	if !h.authEnabled() || session.Identity == nil {
+		return nil
+	}
+	return session.Identity.CanAccess
+}
+
+// AuthorizeDatabase implements protocol.DatabaseAuthorizer for the handshake
+// and COM_INIT_DB paths on replicas.
+func (h *ReadOnlyHandler) AuthorizeDatabase(session *protocol.ConnectionSession, database string) error {
+	if h.dbManager != nil && !h.dbManager.DatabaseExists(database) {
+		return protocol.NewMySQLError(
+			protocol.ErrCodeBadDB,
+			protocol.SQLStateSyntax,
+			fmt.Sprintf("Unknown database '%s'", database),
+		)
+	}
+	if !h.authEnabled() {
+		return nil
+	}
+	return h.authMgr.Authorize(session.Identity, database, "USE", "", false)
+}
+
+// authorizeRead enforces a read grant on a resolved database.
+func (h *ReadOnlyHandler) authorizeRead(session *protocol.ConnectionSession, database string) error {
+	if !h.authEnabled() || database == "" {
+		return nil
+	}
+	return h.authMgr.Authorize(session.Identity, database, "SHOW", "", false)
+}
+
+// replicaCommand maps a statement type to the MySQL command verb used in
+// write-denial messages.
+func replicaCommand(stmt protocol.Statement) string {
+	switch stmt.Type {
+	case protocol.StatementInsert:
+		return "INSERT"
+	case protocol.StatementReplace:
+		return "REPLACE"
+	case protocol.StatementUpdate:
+		return "UPDATE"
+	case protocol.StatementDelete:
+		return "DELETE"
+	case protocol.StatementLoadData:
+		return "LOAD"
+	case protocol.StatementCreateDatabase, protocol.StatementDropDatabase,
+		protocol.StatementDDL, protocol.StatementCreateVectorIndex,
+		protocol.StatementDropVectorIndex, protocol.StatementReindexVectorIndex:
+		return "CREATE"
+	default:
+		return "COMMAND"
+	}
+}
+
+// forwardUsername returns the authenticated account name to attach to a
+// request forwarded to the leader, so the leader enforces the same grants
+// for the forwarded write. Empty in open mode.
+func forwardUsername(session *protocol.ConnectionSession) string {
+	if session.Identity != nil {
+		return session.Identity.Name
+	}
+	return ""
 }
 
 // NewReadOnlyHandler creates a new read-only handler
@@ -101,6 +180,17 @@ func (h *ReadOnlyHandler) HandleQuery(session *protocol.ConnectionSession, sql s
 
 	// Reject all mutations with MySQL read-only error
 	if protocol.IsMutation(stmt) {
+		// Enforce the account's write grant locally before forwarding to
+		// the leader; the leader re-checks it as well.
+		targetDB := stmt.Database
+		if targetDB == "" {
+			targetDB = session.CurrentDatabase
+		}
+		if h.authEnabled() && targetDB != "" {
+			if err := h.authMgr.Authorize(session.Identity, targetDB, replicaCommand(stmt), stmt.TableName, true); err != nil {
+				return nil, err
+			}
+		}
 		if h.forwardWrites {
 			return h.forwardMutation(session, sql, stmt, params)
 		}
@@ -140,8 +230,11 @@ func (h *ReadOnlyHandler) HandleQuery(session *protocol.ConnectionSession, sql s
 	// Handle database management commands (read-only)
 	switch stmt.Type {
 	case protocol.StatementShowDatabases:
-		return h.metadata.HandleShowDatabases()
+		return h.metadata.HandleShowDatabases(h.schemaVisibility(session))
 	case protocol.StatementUseDatabase:
+		if err := h.AuthorizeDatabase(session, stmt.Database); err != nil {
+			return nil, err
+		}
 		if err := h.metadata.HandleUseDatabase(stmt.Database); err != nil {
 			return nil, err
 		}
@@ -156,11 +249,17 @@ func (h *ReadOnlyHandler) HandleQuery(session *protocol.ConnectionSession, sql s
 		if dbName == "" {
 			dbName = session.CurrentDatabase
 		}
+		if err := h.authorizeRead(session, dbName); err != nil {
+			return nil, err
+		}
 		return h.metadata.HandleShowTables(dbName, stmt.ShowFilter)
 	case protocol.StatementShowColumns:
 		dbName := stmt.Database
 		if dbName == "" {
 			dbName = session.CurrentDatabase
+		}
+		if err := h.authorizeRead(session, dbName); err != nil {
+			return nil, err
 		}
 		return h.metadata.HandleShowColumns(dbName, stmt.TableName)
 	case protocol.StatementShowCreateTable:
@@ -168,11 +267,17 @@ func (h *ReadOnlyHandler) HandleQuery(session *protocol.ConnectionSession, sql s
 		if dbName == "" {
 			dbName = session.CurrentDatabase
 		}
+		if err := h.authorizeRead(session, dbName); err != nil {
+			return nil, err
+		}
 		return h.metadata.HandleShowCreateTable(dbName, stmt.TableName)
 	case protocol.StatementShowIndexes:
 		dbName := stmt.Database
 		if dbName == "" {
 			dbName = session.CurrentDatabase
+		}
+		if err := h.authorizeRead(session, dbName); err != nil {
+			return nil, err
 		}
 		return h.metadata.HandleShowIndexes(dbName, stmt.TableName)
 	case protocol.StatementShowTableStatus:
@@ -180,14 +285,22 @@ func (h *ReadOnlyHandler) HandleQuery(session *protocol.ConnectionSession, sql s
 		if dbName == "" {
 			dbName = session.CurrentDatabase
 		}
+		if err := h.authorizeRead(session, dbName); err != nil {
+			return nil, err
+		}
 		return h.metadata.HandleShowTableStatus(dbName, stmt.TableName)
 	case protocol.StatementInformationSchema:
-		return h.metadata.HandleInformationSchema(session.CurrentDatabase, stmt)
+		return h.metadata.HandleInformationSchema(session.CurrentDatabase, stmt, h.schemaVisibility(session))
 	}
 
 	// Set database context from session if not specified in statement
 	if stmt.Database == "" {
 		stmt.Database = session.CurrentDatabase
+	}
+
+	// Enforce the read grant before executing locally.
+	if err := h.authorizeRead(session, stmt.Database); err != nil {
+		return nil, err
 	}
 
 	// Execute read locally
@@ -202,6 +315,17 @@ func (h *ReadOnlyHandler) HandleLoadData(session *protocol.ConnectionSession, sq
 	}
 	if !h.forwardWrites {
 		return nil, protocol.ErrReadOnly()
+	}
+
+	// Enforce the write grant before forwarding to the leader.
+	targetDB := stmt.Database
+	if targetDB == "" {
+		targetDB = session.CurrentDatabase
+	}
+	if h.authEnabled() && targetDB != "" {
+		if err := h.authMgr.Authorize(session.Identity, targetDB, "LOAD", stmt.TableName, true); err != nil {
+			return nil, err
+		}
 	}
 
 	client := h.replica.streamClient.GetClient()
@@ -219,6 +343,7 @@ func (h *ReadOnlyHandler) HandleLoadData(session *protocol.ConnectionSession, sq
 		Data:               data,
 		WaitForReplication: session.WaitForReplication,
 		TimeoutMs:          uint32(h.forwardTimeout.Milliseconds()),
+		Username:           forwardUsername(session),
 	})
 	if err != nil {
 		return nil, protocol.NewMySQLError(protocol.ErrCodeUnknown, protocol.SQLStateGeneral, fmt.Sprintf("Lost connection to leader during query: %v", err))
@@ -437,6 +562,7 @@ func (h *ReadOnlyHandler) forwardMutation(session *protocol.ConnectionSession, s
 		WaitForReplication: session.WaitForReplication,
 		Params:             serializedParams,
 		TimeoutMs:          uint32(h.forwardTimeout.Milliseconds()),
+		Username:           forwardUsername(session),
 	})
 
 	if err != nil {
@@ -511,6 +637,7 @@ func (h *ReadOnlyHandler) forwardTxnControl(session *protocol.ConnectionSession,
 		TxnControl:         txnControl,
 		WaitForReplication: session.WaitForReplication,
 		TimeoutMs:          uint32(h.forwardTimeout.Milliseconds()),
+		Username:           forwardUsername(session),
 	})
 
 	if err != nil {

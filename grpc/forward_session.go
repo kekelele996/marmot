@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/maxpert/marmot/auth"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/rs/zerolog/log"
 )
@@ -27,6 +28,7 @@ type forwardRequestState struct {
 type ForwardSession struct {
 	Key          ForwardSessionKey
 	Database     string
+	Identity     *auth.Identity
 	ConnSession  *protocol.ConnectionSession
 	LastActivity time.Time
 
@@ -75,8 +77,11 @@ func (m *ForwardSessionManager) SetSessionCloser(closer func(*protocol.Connectio
 	m.onSessionRemoved = closer
 }
 
-// GetOrCreateSession retrieves an existing session or creates a new one
-func (m *ForwardSessionManager) GetOrCreateSession(key ForwardSessionKey, db string) *ForwardSession {
+// GetOrCreateSession retrieves an existing session or creates a new one.
+// identity is the client account the replica authenticated (nil in open
+// mode) and is attached to every request's leader-side session so the
+// coordinator enforces the same grants it does for direct connections.
+func (m *ForwardSessionManager) GetOrCreateSession(key ForwardSessionKey, db string, identity *auth.Identity) *ForwardSession {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -88,7 +93,8 @@ func (m *ForwardSessionManager) GetOrCreateSession(key ForwardSessionKey, db str
 	session := &ForwardSession{
 		Key:           key,
 		Database:      db,
-		ConnSession:   newForwardConnSession(key.SessionID, db),
+		Identity:      identity,
+		ConnSession:   newForwardConnSession(key.SessionID, db, identity),
 		LastActivity:  time.Now(),
 		requestStates: make(map[uint64]*forwardRequestState),
 		requestOrder:  make([]uint64, 0, 16),
@@ -223,10 +229,11 @@ func (m *ForwardSessionManager) Stop() {
 	close(m.stopCh)
 }
 
-func newForwardConnSession(connID uint64, db string) *protocol.ConnectionSession {
+func newForwardConnSession(connID uint64, db string, identity *auth.Identity) *protocol.ConnectionSession {
 	return &protocol.ConnectionSession{
 		ConnID:               connID,
 		CurrentDatabase:      db,
+		Identity:             identity,
 		TranspilationEnabled: false, // Forwarded SQL is already transpiled on replica
 	}
 }
@@ -319,7 +326,7 @@ func (s *ForwardSession) ensureDatabaseLocked(db string) {
 	}
 	s.Database = db
 	if s.ConnSession == nil {
-		s.ConnSession = newForwardConnSession(s.Key.SessionID, db)
+		s.ConnSession = newForwardConnSession(s.Key.SessionID, db, s.Identity)
 		return
 	}
 	s.ConnSession.CurrentDatabase = db

@@ -3855,6 +3855,7 @@ type ForwardQueryRequest struct {
 	WaitForReplication bool                   `protobuf:"varint,6,opt,name=wait_for_replication,json=waitForReplication,proto3" json:"wait_for_replication,omitempty"` // Block until replicated back
 	Params             [][]byte               `protobuf:"bytes,7,rep,name=params,proto3" json:"params,omitempty"`                                                      // Prepared statement params (msgpack encoded)
 	TimeoutMs          uint32                 `protobuf:"varint,8,opt,name=timeout_ms,json=timeoutMs,proto3" json:"timeout_ms,omitempty"`                              // Client-specified timeout in milliseconds
+	Username           string                 `protobuf:"bytes,10,opt,name=username,proto3" json:"username,omitempty"`                                                 // Authenticated client account, for leader-side authorization
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
@@ -3950,6 +3951,13 @@ func (x *ForwardQueryRequest) GetTimeoutMs() uint32 {
 		return x.TimeoutMs
 	}
 	return 0
+}
+
+func (x *ForwardQueryRequest) GetUsername() string {
+	if x != nil {
+		return x.Username
+	}
+	return ""
 }
 
 type ForwardQueryResponse struct {
@@ -4071,6 +4079,7 @@ type ForwardLoadDataRequest struct {
 	Data               []byte                 `protobuf:"bytes,6,opt,name=data,proto3" json:"data,omitempty"`
 	WaitForReplication bool                   `protobuf:"varint,7,opt,name=wait_for_replication,json=waitForReplication,proto3" json:"wait_for_replication,omitempty"`
 	TimeoutMs          uint32                 `protobuf:"varint,8,opt,name=timeout_ms,json=timeoutMs,proto3" json:"timeout_ms,omitempty"`
+	Username           string                 `protobuf:"bytes,9,opt,name=username,proto3" json:"username,omitempty"` // Authenticated client account, for leader-side authorization
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
@@ -4159,6 +4168,13 @@ func (x *ForwardLoadDataRequest) GetTimeoutMs() uint32 {
 		return x.TimeoutMs
 	}
 	return 0
+}
+
+func (x *ForwardLoadDataRequest) GetUsername() string {
+	if x != nil {
+		return x.Username
+	}
+	return ""
 }
 
 type LoadDataChunkRequest struct {
@@ -4583,7 +4599,7 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"\x18TransactionStreamMessage\x123\n" +
 	"\x05chunk\x18\x01 \x01(\v2\x1b.marmot.v2.TransactionChunkH\x00R\x05chunk\x126\n" +
 	"\x06commit\x18\x02 \x01(\v2\x1c.marmot.v2.TransactionCommitH\x00R\x06commitB\t\n" +
-	"\apayload\"\xd1\x02\n" +
+	"\apayload\"\xed\x02\n" +
 	"\x13ForwardQueryRequest\x12&\n" +
 	"\x0freplica_node_id\x18\x01 \x01(\x04R\rreplicaNodeId\x12\x1d\n" +
 	"\n" +
@@ -4597,7 +4613,9 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"\x14wait_for_replication\x18\x06 \x01(\bR\x12waitForReplication\x12\x16\n" +
 	"\x06params\x18\a \x03(\fR\x06params\x12\x1d\n" +
 	"\n" +
-	"timeout_ms\x18\b \x01(\rR\ttimeoutMs\"\xad\x02\n" +
+	"timeout_ms\x18\b \x01(\rR\ttimeoutMs\x12\x1a\n" +
+	"\busername\x18\n" +
+	" \x01(\tR\busername\"\xad\x02\n" +
 	"\x14ForwardQueryResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12#\n" +
 	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\x12#\n" +
@@ -4607,7 +4625,7 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"\x0ein_transaction\x18\x06 \x01(\bR\rinTransaction\x12\x1d\n" +
 	"\n" +
 	"error_code\x18\a \x01(\rR\terrorCode\x12\x1b\n" +
-	"\tsql_state\x18\b \x01(\tR\bsqlState\"\x91\x02\n" +
+	"\tsql_state\x18\b \x01(\tR\bsqlState\"\xad\x02\n" +
 	"\x16ForwardLoadDataRequest\x12&\n" +
 	"\x0freplica_node_id\x18\x01 \x01(\x04R\rreplicaNodeId\x12\x1d\n" +
 	"\n" +
@@ -4619,7 +4637,8 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"\x04data\x18\x06 \x01(\fR\x04data\x120\n" +
 	"\x14wait_for_replication\x18\a \x01(\bR\x12waitForReplication\x12\x1d\n" +
 	"\n" +
-	"timeout_ms\x18\b \x01(\rR\ttimeoutMs\"\x92\x01\n" +
+	"timeout_ms\x18\b \x01(\rR\ttimeoutMs\x12\x1a\n" +
+	"\busername\x18\t \x01(\tR\busername\"\x92\x01\n" +
 	"\x14LoadDataChunkRequest\x12,\n" +
 	"\x12requesting_node_id\x18\x01 \x01(\x04R\x10requestingNodeId\x12\x17\n" +
 	"\aload_id\x18\x02 \x01(\tR\x06loadId\x12\x16\n" +

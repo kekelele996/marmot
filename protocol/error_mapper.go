@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/mattn/go-sqlite3"
+	"github.com/maxpert/marmot/auth"
 	"github.com/maxpert/marmot/protocol/query/transform"
 )
 
@@ -24,6 +25,13 @@ func ConvertToMySQLError(err error) *MySQLError {
 	var coded *transform.CodedError
 	if errors.As(err, &coded) {
 		return NewMySQLError(coded.Code, sqlStateForCode(coded.Code), coded.Message)
+	}
+
+	// An authentication/authorization failure already carries the exact
+	// MySQL code and SQLSTATE the client must receive.
+	var authErr *auth.Error
+	if errors.As(err, &authErr) {
+		return NewMySQLError(authErr.Code, authErr.SQLState, authErr.Message)
 	}
 
 	// The statement's SQLite transaction has already ended: an explicit

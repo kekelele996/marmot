@@ -99,6 +99,25 @@ type ReplicationConfiguration struct {
 	SnapshotRestoreTimeoutS int `toml:"snapshot_restore_timeout_seconds"`
 }
 
+// MySQLUserConfiguration configures one client account for the MySQL
+// protocol server. Exactly one of Password / PasswordHash must be set.
+type MySQLUserConfiguration struct {
+	Name string `toml:"name"`
+	// Password is the plaintext password (development convenience; prefer
+	// PasswordHash in production so the secret never appears in the file).
+	Password string `toml:"password"`
+	// PasswordHash is the MySQL PASSWORD() digest: "*" followed by 40 hex
+	// chars, i.e. SHA1(SHA1(password)). Bare 40-char hex is also accepted.
+	PasswordHash string `toml:"password_hash"`
+	// Databases lists the databases the account may use. Exact names and glob
+	// patterns ("app_*") are supported; ["*"] grants every user database. An
+	// account granted no databases can connect but read and write nothing.
+	Databases []string `toml:"databases"`
+	// ReadOnly accounts may run read statements on granted databases but
+	// never modify data or schema.
+	ReadOnly bool `toml:"read_only"`
+}
+
 // MySQLConfiguration for MySQL wire protocol server
 type MySQLConfiguration struct {
 	Enabled        bool   `toml:"enabled"`
@@ -109,6 +128,12 @@ type MySQLConfiguration struct {
 	AutoIDMode     string `toml:"auto_id_mode"`         // "compact" (default, 53-bit) or "extended" (64-bit)
 	UnixSocket     string `toml:"unix_socket"`          // Path to Unix socket (empty = disabled)
 	UnixSocketPerm int    `toml:"unix_socket_perm"`     // Permissions, default 0660
+
+	// Users are the accounts clients authenticate as ([[mysql.users]] in
+	// TOML). With at least one user configured every MySQL connection must
+	// authenticate and is confined to its grants; with none configured the
+	// server stays open to everyone (backward compatible, not recommended).
+	Users []MySQLUserConfiguration `toml:"users"`
 }
 
 // LoggingConfiguration controls logging behavior
@@ -607,6 +632,11 @@ func Validate() error {
 		return fmt.Errorf("invalid auto_id_mode: %q (must be \"compact\" or \"extended\")", Config.MySQL.AutoIDMode)
 	}
 
+	// Validate MySQL client accounts
+	if err := validateMySQLUsers(Config.MySQL.Users); err != nil {
+		return err
+	}
+
 	// Validate consistency levels
 	validConsistency := map[string]bool{
 		"ONE": true, "TWO": true, "THREE": true,
@@ -901,6 +931,55 @@ func Validate() error {
 	return nil
 }
 
+// validateMySQLUsers checks [[mysql.users]] entries: unique non-empty names,
+// exactly one password source, a non-empty password, well formed hashes, and
+// at least one database grant.
+func validateMySQLUsers(users []MySQLUserConfiguration) error {
+	names := make(map[string]bool, len(users))
+	for i, u := range users {
+		label := fmt.Sprintf("mysql.users[%d]", i)
+		name := strings.TrimSpace(u.Name)
+		if name == "" {
+			return fmt.Errorf("%s.name cannot be empty", label)
+		}
+		if names[name] {
+			return fmt.Errorf("%s.name %q is not unique - user names must be unique", label, name)
+		}
+		names[name] = true
+
+		if u.Password != "" && u.PasswordHash != "" {
+			return fmt.Errorf("%s %q: set only one of password or password_hash, not both", label, name)
+		}
+		if u.Password == "" && u.PasswordHash == "" {
+			return fmt.Errorf("%s %q: password or password_hash is required (empty passwords are not allowed)", label, name)
+		}
+		if u.PasswordHash != "" {
+			hash := u.PasswordHash
+			if strings.HasPrefix(hash, "*") {
+				hash = hash[1:]
+			}
+			if len(hash) != 40 {
+				return fmt.Errorf("%s %q: password_hash must be 40 hex chars optionally prefixed with '*'", label, name)
+			}
+			for _, c := range hash {
+				if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+					return fmt.Errorf("%s %q: password_hash must be hexadecimal", label, name)
+				}
+			}
+		}
+
+		if len(u.Databases) == 0 {
+			return fmt.Errorf("%s %q: databases must list at least one entry (use [\"*\"] to grant all)", label, name)
+		}
+		for _, db := range u.Databases {
+			if strings.TrimSpace(db) == "" {
+				return fmt.Errorf("%s %q: databases contains an empty entry", label, name)
+			}
+		}
+	}
+	return nil
+}
+
 // IsClusterAuthEnabled returns true if cluster authentication is configured
 func IsClusterAuthEnabled() bool {
 	return Config.Cluster.ClusterSecret != ""
@@ -914,6 +993,12 @@ func GetClusterSecret() string {
 // IsReplicaMode returns true if read-only replica mode is enabled
 func IsReplicaMode() bool {
 	return Config.Replica.Enabled
+}
+
+// IsMySQLAuthEnabled returns true when at least one MySQL client account is
+// configured, in which case every client connection must authenticate.
+func IsMySQLAuthEnabled() bool {
+	return len(Config.MySQL.Users) > 0
 }
 
 // GetReplicaSecret returns the replica secret for PSK authentication with master

@@ -43,10 +43,10 @@ func TestMetadataAnswersWhileTheWriterIsBusy(t *testing.T) {
 		call func() (*protocol.ResultSet, error)
 	}{
 		{"TABLES", func() (*protocol.ResultSet, error) {
-			return h.HandleInformationSchema(dbName, protocol.Statement{ISTableType: protocol.ISTableTables})
+			return h.HandleInformationSchema(dbName, protocol.Statement{ISTableType: protocol.ISTableTables}, nil)
 		}},
 		{"COLUMNS", func() (*protocol.ResultSet, error) {
-			return h.HandleInformationSchema(dbName, protocol.Statement{ISTableType: protocol.ISTableColumns})
+			return h.HandleInformationSchema(dbName, protocol.Statement{ISTableType: protocol.ISTableColumns}, nil)
 		}},
 		{"SHOW INDEX", func() (*protocol.ResultSet, error) { return h.HandleShowIndexes(dbName, "t") }},
 		{"SHOW CREATE TABLE", func() (*protocol.ResultSet, error) { return h.HandleShowCreateTable(dbName, "t") }},

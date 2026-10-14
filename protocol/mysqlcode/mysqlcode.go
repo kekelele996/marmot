@@ -32,6 +32,18 @@ const (
 	// table exists but the client is not permitted to touch it.
 	ErrCodeTableAccessDenied uint16 = 1142
 
+	// ErrCodeDBAccessDenied is MySQL's ER_DBACCESS_DENIED_ERROR: the client
+	// is not permitted to use the named database.
+	ErrCodeDBAccessDenied uint16 = 1044
+
+	// ErrCodeAccessDenied is MySQL's ER_ACCESS_DENIED_ERROR: login failed
+	// (unknown account or wrong password).
+	ErrCodeAccessDenied uint16 = 1045
+
+	// ErrCodeBadDB is MySQL's ER_BAD_DB_ERROR: the named database does not
+	// exist.
+	ErrCodeBadDB uint16 = 1049
+
 	// ErrCodeDataOutOfRange is MySQL's ER_WARN_DATA_OUT_OF_RANGE: a value used
 	// in an operation is outside the range its target can represent.
 	ErrCodeDataOutOfRange uint16 = 1264
@@ -51,6 +63,9 @@ const (
 	// used for ER_SERVER_SHUTDOWN.
 	SQLStateConnFailure = "08S01"
 	SQLStateNoDB        = "3D000"
+	// SQLStateAccessDenied is MySQL's SQLSTATE class for login and privilege
+	// failures (ER_ACCESS_DENIED_ERROR).
+	SQLStateAccessDenied = "28000"
 	// SQLStateDataOutOfRange is MySQL's SQLSTATE class for
 	// ER_WARN_DATA_OUT_OF_RANGE.
 	SQLStateDataOutOfRange = "22003"

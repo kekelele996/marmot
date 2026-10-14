@@ -28,6 +28,9 @@ const (
 	ErrCodeCheckConstraint   = mysqlcode.ErrCodeCheckConstraint
 	ErrCodeTableAccessDenied = mysqlcode.ErrCodeTableAccessDenied
 	ErrCodeDataOutOfRange    = mysqlcode.ErrCodeDataOutOfRange
+	ErrCodeDBAccessDenied    = mysqlcode.ErrCodeDBAccessDenied
+	ErrCodeAccessDenied      = mysqlcode.ErrCodeAccessDenied
+	ErrCodeBadDB             = mysqlcode.ErrCodeBadDB
 )
 
 // SQLSTATE constants. Values live in protocol/mysqlcode; see above.
@@ -42,6 +45,7 @@ const (
 	SQLStateDupColumn      = mysqlcode.SQLStateDupColumn
 	SQLStateConnFailure    = mysqlcode.SQLStateConnFailure
 	SQLStateNoDB           = mysqlcode.SQLStateNoDB
+	SQLStateAccessDenied   = mysqlcode.SQLStateAccessDenied
 	SQLStateDataOutOfRange = mysqlcode.SQLStateDataOutOfRange
 )
 

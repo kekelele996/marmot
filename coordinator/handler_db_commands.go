@@ -12,8 +12,9 @@ const SystemDatabaseName = "__marmot_system"
 
 var ErrSystemDatabaseProtected = errors.New("cannot drop system database")
 
-// handleShowDatabases returns list of all databases
-func (h *CoordinatorHandler) handleShowDatabases() (*protocol.ResultSet, error) {
+// handleShowDatabases returns the databases the connected account is allowed
+// to see (all of them in open mode).
+func (h *CoordinatorHandler) handleShowDatabases(session *protocol.ConnectionSession) (*protocol.ResultSet, error) {
 	if h.dbManager == nil {
 		// Fallback if dbManager not set
 		return &protocol.ResultSet{
@@ -22,7 +23,7 @@ func (h *CoordinatorHandler) handleShowDatabases() (*protocol.ResultSet, error) 
 		}, nil
 	}
 
-	return h.metadata.HandleShowDatabases()
+	return h.metadata.HandleShowDatabases(h.schemaVisibility(session))
 }
 
 // handleShowEngines returns fake MySQL engine list for compatibility
@@ -42,7 +43,9 @@ func (h *CoordinatorHandler) handleShowEngines() (*protocol.ResultSet, error) {
 	}, nil
 }
 
-// handleUseDatabase changes the current database for the session
+// handleUseDatabase changes the current database for the session. Existence
+// and grant checks have already run through AuthorizeDatabase by the time
+// this is reached.
 func (h *CoordinatorHandler) handleUseDatabase(session *protocol.ConnectionSession, dbName string) (*protocol.ResultSet, error) {
 	if h.dbManager != nil && !h.dbManager.DatabaseExists(dbName) {
 		return nil, errors.New("database does not exist: " + dbName)

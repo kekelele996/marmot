@@ -18,7 +18,7 @@ func TestForwardSessionManager_GetOrCreateSession(t *testing.T) {
 
 	key := ForwardSessionKey{ReplicaNodeID: 1, SessionID: 100}
 
-	session1 := mgr.GetOrCreateSession(key, "testdb")
+	session1 := mgr.GetOrCreateSession(key, "testdb", nil)
 	require.NotNil(t, session1)
 	assert.Equal(t, key, session1.Key)
 	assert.Equal(t, "testdb", session1.Database)
@@ -26,7 +26,7 @@ func TestForwardSessionManager_GetOrCreateSession(t *testing.T) {
 	assert.Equal(t, uint64(100), session1.ConnSession.ConnID)
 	assert.Equal(t, "testdb", session1.ConnSession.CurrentDatabase)
 
-	session2 := mgr.GetOrCreateSession(key, "testdb")
+	session2 := mgr.GetOrCreateSession(key, "testdb", nil)
 	assert.Same(t, session1, session2)
 }
 
@@ -35,7 +35,7 @@ func TestForwardSession_RequestDedupe(t *testing.T) {
 	defer mgr.Stop()
 
 	key := ForwardSessionKey{ReplicaNodeID: 1, SessionID: 100}
-	session := mgr.GetOrCreateSession(key, "testdb")
+	session := mgr.GetOrCreateSession(key, "testdb", nil)
 
 	state1, isNew := session.BeginRequest(42)
 	require.True(t, isNew)
@@ -60,7 +60,7 @@ func TestForwardSession_ExecuteUpdatesDatabase(t *testing.T) {
 	defer mgr.Stop()
 
 	key := ForwardSessionKey{ReplicaNodeID: 1, SessionID: 100}
-	session := mgr.GetOrCreateSession(key, "db1")
+	session := mgr.GetOrCreateSession(key, "db1", nil)
 
 	resp, err := session.Execute("db2", func(connSession *protocol.ConnectionSession) (*ForwardQueryResponse, error) {
 		return &ForwardQueryResponse{Success: connSession.CurrentDatabase == "db2"}, nil
@@ -78,7 +78,7 @@ func TestForwardSession_HasActiveTransaction(t *testing.T) {
 	defer mgr.Stop()
 
 	key := ForwardSessionKey{ReplicaNodeID: 1, SessionID: 100}
-	session := mgr.GetOrCreateSession(key, "testdb")
+	session := mgr.GetOrCreateSession(key, "testdb", nil)
 	assert.False(t, session.HasActiveTransaction())
 
 	_, err := session.Execute("testdb", func(connSession *protocol.ConnectionSession) (*ForwardQueryResponse, error) {
@@ -101,11 +101,11 @@ func TestForwardSessionManager_RemoveSession(t *testing.T) {
 	defer mgr.Stop()
 
 	key := ForwardSessionKey{ReplicaNodeID: 1, SessionID: 100}
-	mgr.GetOrCreateSession(key, "testdb")
+	mgr.GetOrCreateSession(key, "testdb", nil)
 
 	mgr.RemoveSession(key)
 
-	session := mgr.GetOrCreateSession(key, "testdb")
+	session := mgr.GetOrCreateSession(key, "testdb", nil)
 	require.NotNil(t, session)
 }
 
@@ -117,9 +117,9 @@ func TestForwardSessionManager_RemoveSessionsForReplica(t *testing.T) {
 	key2 := ForwardSessionKey{ReplicaNodeID: 1, SessionID: 101}
 	key3 := ForwardSessionKey{ReplicaNodeID: 2, SessionID: 200}
 
-	mgr.GetOrCreateSession(key1, "db1")
-	mgr.GetOrCreateSession(key2, "db2")
-	mgr.GetOrCreateSession(key3, "db3")
+	mgr.GetOrCreateSession(key1, "db1", nil)
+	mgr.GetOrCreateSession(key2, "db2", nil)
+	mgr.GetOrCreateSession(key3, "db3", nil)
 
 	mgr.RemoveSessionsForReplica(1)
 
@@ -161,7 +161,7 @@ func TestCloseRemovedForwardSession_InvokesCloserWhenIdle(t *testing.T) {
 	})
 
 	key := ForwardSessionKey{ReplicaNodeID: 1, SessionID: 200}
-	mgr.GetOrCreateSession(key, "testdb")
+	mgr.GetOrCreateSession(key, "testdb", nil)
 
 	mgr.RemoveSession(key)
 
@@ -209,7 +209,7 @@ func TestCloseRemovedForwardSession_SerializesAgainstInFlightExecute(t *testing.
 	})
 
 	key := ForwardSessionKey{ReplicaNodeID: 1, SessionID: 300}
-	session := mgr.GetOrCreateSession(key, "testdb")
+	session := mgr.GetOrCreateSession(key, "testdb", nil)
 
 	execDone := make(chan struct{})
 	go func() {
@@ -253,7 +253,7 @@ func TestForwardSessionManager_SessionTimeout(t *testing.T) {
 	defer mgr.Stop()
 
 	key := ForwardSessionKey{ReplicaNodeID: 1, SessionID: 100}
-	session := mgr.GetOrCreateSession(key, "testdb")
+	session := mgr.GetOrCreateSession(key, "testdb", nil)
 	require.NotNil(t, session)
 
 	session.mu.Lock()

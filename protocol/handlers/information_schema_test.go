@@ -105,40 +105,40 @@ func TestMetadataNeverWaitsOnItself(t *testing.T) {
 		wantRows int
 	}{
 		{"TABLES of the session db", func() (*protocol.ResultSet, error) {
-			return h.HandleInformationSchema("testdb", isStatement(protocol.ISTableTables, "", ""))
+			return h.HandleInformationSchema("testdb", isStatement(protocol.ISTableTables, "", ""), nil)
 		}, 21, 2},
 		{"TABLES filtered by schema and table", func() (*protocol.ResultSet, error) {
-			return h.HandleInformationSchema("", isStatement(protocol.ISTableTables, "testdb", "users"))
+			return h.HandleInformationSchema("", isStatement(protocol.ISTableTables, "testdb", "users"), nil)
 		}, 21, 1},
 		{"TABLES with no database: every schema, same columns", func() (*protocol.ResultSet, error) {
-			return h.HandleInformationSchema("", isStatement(protocol.ISTableTables, "", ""))
+			return h.HandleInformationSchema("", isStatement(protocol.ISTableTables, "", ""), nil)
 		}, 21, 2},
 		{"TABLES of an unknown schema is empty", func() (*protocol.ResultSet, error) {
-			return h.HandleInformationSchema("testdb", isStatement(protocol.ISTableTables, "nosuch", ""))
+			return h.HandleInformationSchema("testdb", isStatement(protocol.ISTableTables, "nosuch", ""), nil)
 		}, 21, 0},
 		{"TABLES of the system database is empty", func() (*protocol.ResultSet, error) {
-			return h.HandleInformationSchema("testdb", isStatement(protocol.ISTableTables, "__marmot_system", ""))
+			return h.HandleInformationSchema("testdb", isStatement(protocol.ISTableTables, "__marmot_system", ""), nil)
 		}, 21, 0},
 		{"COLUMNS of every table", func() (*protocol.ResultSet, error) {
-			return h.HandleInformationSchema("testdb", isStatement(protocol.ISTableColumns, "", ""))
+			return h.HandleInformationSchema("testdb", isStatement(protocol.ISTableColumns, "", ""), nil)
 		}, 20, 5},
 		{"COLUMNS of one table", func() (*protocol.ResultSet, error) {
-			return h.HandleInformationSchema("", isStatement(protocol.ISTableColumns, "testdb", "users"))
+			return h.HandleInformationSchema("", isStatement(protocol.ISTableColumns, "testdb", "users"), nil)
 		}, 20, 3},
 		{"COLUMNS of an unknown table", func() (*protocol.ResultSet, error) {
-			return h.HandleInformationSchema("testdb", isStatement(protocol.ISTableColumns, "", "nosuch"))
+			return h.HandleInformationSchema("testdb", isStatement(protocol.ISTableColumns, "", "nosuch"), nil)
 		}, 20, 0},
 		{"SCHEMATA", func() (*protocol.ResultSet, error) {
-			return h.HandleInformationSchema("", isStatement(protocol.ISTableSchemata, "", ""))
+			return h.HandleInformationSchema("", isStatement(protocol.ISTableSchemata, "", ""), nil)
 		}, 5, 1},
 		{"SCHEMATA filtered", func() (*protocol.ResultSet, error) {
-			return h.HandleInformationSchema("", isStatement(protocol.ISTableSchemata, "nosuch", ""))
+			return h.HandleInformationSchema("", isStatement(protocol.ISTableSchemata, "nosuch", ""), nil)
 		}, 5, 0},
 		{"STATISTICS of one table", func() (*protocol.ResultSet, error) {
-			return h.HandleInformationSchema("testdb", isStatement(protocol.ISTableStatistics, "", "users"))
+			return h.HandleInformationSchema("testdb", isStatement(protocol.ISTableStatistics, "", "users"), nil)
 		}, 8, 1},
 		{"STATISTICS without a table", func() (*protocol.ResultSet, error) {
-			return h.HandleInformationSchema("testdb", isStatement(protocol.ISTableStatistics, "", ""))
+			return h.HandleInformationSchema("testdb", isStatement(protocol.ISTableStatistics, "", ""), nil)
 		}, 8, 0},
 		{"SHOW TABLES", func() (*protocol.ResultSet, error) { return h.HandleShowTables("testdb", "") }, 1, 2},
 		{"SHOW TABLES LIKE", func() (*protocol.ResultSet, error) { return h.HandleShowTables("testdb", "u%") }, 1, 1},
@@ -167,7 +167,7 @@ func TestInformationSchemaRowValues(t *testing.T) {
 	h := newOnePoolHandler(t)
 
 	cols := answerWithin(t, "COLUMNS users", func() (*protocol.ResultSet, error) {
-		return h.HandleInformationSchema("", isStatement(protocol.ISTableColumns, "testdb", "users"))
+		return h.HandleInformationSchema("", isStatement(protocol.ISTableColumns, "testdb", "users"), nil)
 	})
 	require.Equal(t, []interface{}{"def", "testdb", "users", "id", 1, nil, "YES", "int", nil, nil, nil, nil, nil,
 		"utf8mb4", "utf8mb4_general_ci", "int", "PRI", "", "select,insert,update,references", ""}, cols.Rows[0])
@@ -176,12 +176,12 @@ func TestInformationSchemaRowValues(t *testing.T) {
 	require.Equal(t, "'none'", cols.Rows[2][5])
 
 	idx := answerWithin(t, "STATISTICS users", func() (*protocol.ResultSet, error) {
-		return h.HandleInformationSchema("testdb", isStatement(protocol.ISTableStatistics, "", "users"))
+		return h.HandleInformationSchema("testdb", isStatement(protocol.ISTableStatistics, "", "users"), nil)
 	})
 	require.Equal(t, []interface{}{"def", "testdb", "users", 1, "testdb", "idx_users_email", 1, "email"}, idx.Rows[0])
 
 	tables := answerWithin(t, "TABLES", func() (*protocol.ResultSet, error) {
-		return h.HandleInformationSchema("testdb", isStatement(protocol.ISTableTables, "", ""))
+		return h.HandleInformationSchema("testdb", isStatement(protocol.ISTableTables, "", ""), nil)
 	})
 	require.Equal(t, "posts", tables.Rows[0][2])
 	require.Equal(t, "users", tables.Rows[1][2])
