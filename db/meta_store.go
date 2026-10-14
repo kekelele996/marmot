@@ -181,6 +181,12 @@ type MetaStore interface {
 	IterateCapturedRows(txnID uint64) (CapturedRowCursor, error)
 	DeleteCapturedRow(txnID, seq uint64) error
 	DeleteCapturedRows(txnID uint64) error
+	// DiscardCapturedRowsInRange excludes txnID's still-pending raw rows
+	// whose seq is in the inclusive [lo, hi] range: rows a statement's hook
+	// captured before the statement failed and SQLite rolled its changes
+	// back. Discarded rows are never sealed, counted in the prepare payload,
+	// or replayed. Must be called before SealCapturedRows.
+	DiscardCapturedRowsInRange(txnID, lo, hi uint64) error
 
 	// CDC active locks for conflict detection
 	AcquireCDCRowLock(txnID uint64, tableName, intentKey string) error

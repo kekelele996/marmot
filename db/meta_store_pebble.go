@@ -2221,6 +2221,17 @@ func (s *PebbleMetaStore) DeleteCapturedRow(txnID, seq uint64) error {
 	return nil
 }
 
+// DiscardCapturedRowsInRange logically drops the pending raw rows of a
+// statement that failed (see cdcSegmentLog.discardRowsInRange). A no-op for a
+// txn with no spilled rows or one already sealed.
+func (s *PebbleMetaStore) DiscardCapturedRowsInRange(txnID, lo, hi uint64) error {
+	if s == nil || s.closed.Load() {
+		return fmt.Errorf("pebble metastore closed")
+	}
+	s.cdcLog.discardRowsInRange(txnID, lo, hi)
+	return nil
+}
+
 // DeleteCapturedRows deletes all raw captured rows for a transaction.
 // Called after ProcessCapturedRows completes.
 func (s *PebbleMetaStore) DeleteCapturedRows(txnID uint64) error {

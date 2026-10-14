@@ -835,9 +835,25 @@ var _ coordinator.PinnedSession = (*pinnedHookSession)(nil)
 // captures and row-locks any newly captured CDC rows immediately so a
 // conflicting transaction sees the lock from statement time, not just from
 // Release.
+//
+// On failure the statement's own captures are discarded: SQLite rolls a
+// failed statement's row changes back (statement-level atomicity), but the
+// preupdate hook already fired for the rolled-back rows, so leaving them
+// would let the next successful statement capture them and COMMIT replay
+// writes the failed statement never made - breaking the transaction's
+// all-or-nothing guarantee. Earlier statements' rows (seq <= beginSeq) are
+// untouched.
 func (p *pinnedHookSession) ExecuteStatement(ctx context.Context, sql string, params []interface{}) (int64, int64, error) {
+	beginSeq := p.session.currentCaptureSeq()
 	rowsAffected, err := p.session.ExecContext(ctx, sql, params...)
 	if err != nil {
+		endSeq := p.session.currentCaptureSeq()
+		if discardErr := p.session.discardStatementCaptures(beginSeq+1, endSeq); discardErr != nil {
+			// Swallowing this would risk leaking the rolled-back rows into
+			// COMMIT, so fail loudly instead of hiding it behind the
+			// original statement error.
+			return 0, 0, fmt.Errorf("statement failed (%v); cleaning up its rolled-back CDC rows also failed: %w", err, discardErr)
+		}
 		return 0, 0, err
 	}
 	if err := p.session.captureAndLockNewRows(); err != nil {

@@ -94,6 +94,149 @@ func TestCDCSegmentLogRecoverPreparedManifest(t *testing.T) {
 	}
 }
 
+// cursorSeqs drains a txn's pending-manifest cursor and returns the visible
+// row sequence numbers in iteration order.
+func cursorSeqs(t *testing.T, l *cdcSegmentLog, txnID uint64) []uint64 {
+	t.Helper()
+	manifest := l.getPendingManifest(txnID)
+	if manifest == nil {
+		return nil
+	}
+	cursor := newCDCSegmentCursor(l, manifest)
+	defer cursor.Close()
+	var seqs []uint64
+	for cursor.Next() {
+		seq, _ := cursor.Row()
+		seqs = append(seqs, seq)
+	}
+	if err := cursor.Err(); err != nil {
+		t.Fatalf("cursor err: %v", err)
+	}
+	return seqs
+}
+
+func TestCDCSegmentLogDiscardRowsInRangePartial(t *testing.T) {
+	l, err := openCDCSegmentLog(t.TempDir())
+	if err != nil {
+		t.Fatalf("open log: %v", err)
+	}
+	defer l.close()
+
+	const txnID uint64 = 42
+	for seq := uint64(1); seq <= 5; seq++ {
+		if err := l.appendRow(txnID, seq, []byte{byte(seq)}); err != nil {
+			t.Fatalf("append row %d: %v", seq, err)
+		}
+	}
+
+	// Statement covering seqs 4..5 fails: both rows are discarded.
+	l.discardRowsInRange(txnID, 4, 5)
+
+	if rows, pending := l.pendingRowCount(txnID); !pending || rows != 3 {
+		t.Fatalf("pending rows = (%d,%v), want (3,true)", rows, pending)
+	}
+	if m := l.getPendingManifest(txnID); m == nil || m.FirstSeq != 1 || m.LastSeq != 3 {
+		t.Fatalf("manifest bounds = %+v, want first=1 last=3", m)
+	}
+	if seqs := cursorSeqs(t, l, txnID); len(seqs) != 3 || seqs[0] != 1 || seqs[2] != 3 {
+		t.Fatalf("visible seqs = %v, want [1 2 3]", seqs)
+	}
+
+	// A later successful statement appends past the discarded tail.
+	if err := l.appendRow(txnID, 6, []byte{6}); err != nil {
+		t.Fatalf("append row 6: %v", err)
+	}
+	if seqs := cursorSeqs(t, l, txnID); len(seqs) != 4 || seqs[3] != 6 {
+		t.Fatalf("visible seqs = %v, want [1 2 3 6]", seqs)
+	}
+}
+
+func TestCDCSegmentLogDiscardRowsInRangeAllResetsManifest(t *testing.T) {
+	l, err := openCDCSegmentLog(t.TempDir())
+	if err != nil {
+		t.Fatalf("open log: %v", err)
+	}
+	defer l.close()
+
+	const txnID uint64 = 43
+	for seq := uint64(1); seq <= 2; seq++ {
+		if err := l.appendRow(txnID, seq, []byte{byte(seq)}); err != nil {
+			t.Fatalf("append row %d: %v", seq, err)
+		}
+	}
+	l.discardRowsInRange(txnID, 1, 2)
+
+	if _, pending := l.pendingRowCount(txnID); pending {
+		t.Fatal("manifest should be gone after discarding all its rows")
+	}
+
+	// A fresh append rebuilds a manifest with correct, fresh bounds.
+	if err := l.appendRow(txnID, 3, []byte{3}); err != nil {
+		t.Fatalf("append row 3: %v", err)
+	}
+	if rows, pending := l.pendingRowCount(txnID); !pending || rows != 1 {
+		t.Fatalf("pending rows = (%d,%v), want (1,true)", rows, pending)
+	}
+	if m := l.getPendingManifest(txnID); m == nil || m.FirstSeq != 3 || m.LastSeq != 3 {
+		t.Fatalf("manifest bounds = %+v, want first=last=3", m)
+	}
+	if seqs := cursorSeqs(t, l, txnID); len(seqs) != 1 || seqs[0] != 3 {
+		t.Fatalf("visible seqs = %v, want [3]", seqs)
+	}
+}
+
+func TestCDCSegmentLogDiscardRangesSurviveSealAndReopen(t *testing.T) {
+	dir := t.TempDir()
+	const txnID uint64 = 44
+
+	l, err := openCDCSegmentLog(dir)
+	if err != nil {
+		t.Fatalf("open log: %v", err)
+	}
+	for seq := uint64(1); seq <= 4; seq++ {
+		if err := l.appendRow(txnID, seq, []byte{byte(seq)}); err != nil {
+			t.Fatalf("append row %d: %v", seq, err)
+		}
+	}
+	l.discardRowsInRange(txnID, 3, 4)
+	manifest, err := l.sealTxn(txnID, nil, true)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	if manifest.RowCount != 2 {
+		t.Fatalf("sealed row count = %d, want 2", manifest.RowCount)
+	}
+	if err := l.close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	reopened, err := openCDCSegmentLog(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.close()
+
+	// The sealed manifest recovered from the PREPARE record must still hide
+	// the discarded rows from any reader (commit replay, anti-entropy).
+	recovered := reopened.getPendingManifest(txnID)
+	if recovered == nil {
+		t.Fatal("sealed manifest not recovered")
+	}
+	cursor := newCDCSegmentCursor(reopened, recovered)
+	defer cursor.Close()
+	var seqs []uint64
+	for cursor.Next() {
+		seq, _ := cursor.Row()
+		seqs = append(seqs, seq)
+	}
+	if err := cursor.Err(); err != nil {
+		t.Fatalf("cursor err: %v", err)
+	}
+	if len(seqs) != 2 || seqs[0] != 1 || seqs[1] != 2 {
+		t.Fatalf("recovered visible seqs = %v, want [1 2]", seqs)
+	}
+}
+
 func TestCDCSegmentLogRejectsOversizedRecord(t *testing.T) {
 	log, err := openCDCSegmentLog(t.TempDir())
 	if err != nil {

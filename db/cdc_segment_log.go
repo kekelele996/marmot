@@ -38,6 +38,12 @@ type cdcSegmentChunk struct {
 	Length    uint64 `msgpack:"l"`
 }
 
+// cdcSeqRange is an inclusive [Lo, Hi] sequence-number range.
+type cdcSeqRange struct {
+	Lo uint64 `msgpack:"l"`
+	Hi uint64 `msgpack:"h"`
+}
+
 type cdcSegmentTxnManifest struct {
 	TxnID          uint64            `msgpack:"t"`
 	NodeID         uint64            `msgpack:"n"`
@@ -48,12 +54,27 @@ type cdcSegmentTxnManifest struct {
 	LastSeq        uint64            `msgpack:"z"`
 	Chunks         []cdcSegmentChunk `msgpack:"c"`
 	CRC32          uint32            `msgpack:"x"`
+	// DiscardRanges lists seq ranges captured for statements that failed and
+	// were rolled back by SQLite. The bytes stay in the append-only segment,
+	// but every cursor skips them and RowCount/LastSeq exclude them, so a
+	// sealed manifest never publishes or counts a failed statement's rows.
+	DiscardRanges []cdcSeqRange `msgpack:"d,omitempty"`
 
 	inlineRows     []cdcSegmentInlineRow
 	inlineBytes    uint64
 	inlineDisabled bool
 	prepareChunks  []cdcSegmentChunk
 	sealed         bool
+}
+
+// seqDiscarded reports whether seq falls in one of the manifest's sorted,
+// non-overlapping discard ranges.
+func (m *cdcSegmentTxnManifest) seqDiscarded(seq uint64) bool {
+	if len(m.DiscardRanges) == 0 {
+		return false
+	}
+	i := sort.Search(len(m.DiscardRanges), func(i int) bool { return seq <= m.DiscardRanges[i].Hi })
+	return i < len(m.DiscardRanges) && seq >= m.DiscardRanges[i].Lo
 }
 
 type cdcSegmentInlineRow struct {
@@ -479,6 +500,90 @@ func (l *cdcSegmentLog) discardTxn(txnID uint64) {
 	l.mu.Unlock()
 }
 
+// discardRowsInRange excludes txnID's pending rows whose seq is in the
+// inclusive range [lo, hi] from its manifest. The range is the exact set of
+// rows the preupdate hook captured for one statement that then failed: a
+// pinned session's seq space is dense and private to the transaction, so the
+// statement owns hi-lo+1 consecutive rows, and - rows arriving strictly in
+// statement order - they are the manifest's newest rows.
+//
+// The segment bytes themselves are append-only and stay on disk (they may be
+// interleaved with other transactions' records); the discard is logical:
+// cursors skip DiscardRanges, RowCount/LastSeq are corrected, and sealing
+// persists the ranges so recovery and replay exclude the rows as well. When
+// every pending row is discarded the manifest is dropped entirely; later
+// appends start a fresh manifest whose FirstSeq is correct, and the orphaned
+// bytes are reclaimed by segment pruning.
+//
+// No-op when the txn has no pending (spilled) rows - that means its captures
+// are still session memory, which the caller drops itself.
+func (l *cdcSegmentLog) discardRowsInRange(txnID, lo, hi uint64) {
+	if hi < lo {
+		return
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	m := l.pending[txnID]
+	if m == nil {
+		return
+	}
+
+	removed := hi - lo + 1
+	if removed >= m.RowCount {
+		// Every row this manifest held belonged to failed statements. Drop
+		// the manifest so it is neither sealed nor counted; the bytes are
+		// unreferenced garbage pruned later.
+		delete(l.pending, txnID)
+		return
+	}
+
+	m.RowCount -= removed
+	// Rows arrive in statement order, so everything above lo is the failed
+	// statement's tail; the surviving last row is the previous statement's,
+	// whose seq is lo-1.
+	m.LastSeq = lo - 1
+
+	if len(m.inlineRows) > 0 {
+		kept := m.inlineRows[:0]
+		var inlineBytes uint64
+		for _, row := range m.inlineRows {
+			if row.seq >= lo && row.seq <= hi {
+				continue
+			}
+			kept = append(kept, row)
+			inlineBytes += uint64(len(row.data))
+		}
+		m.inlineRows = kept
+		m.inlineBytes = inlineBytes
+	}
+
+	m.DiscardRanges = mergeDiscardRange(m.DiscardRanges, cdcSeqRange{Lo: lo, Hi: hi})
+}
+
+// mergeDiscardRange inserts r into sorted, non-overlapping ranges, coalescing
+// on overlap/adjacency. Ranges arrive in ascending statement order, but
+// adjacency handling keeps the representation small regardless.
+func mergeDiscardRange(ranges []cdcSeqRange, r cdcSeqRange) []cdcSeqRange {
+	idx := sort.Search(len(ranges), func(i int) bool { return ranges[i].Lo >= r.Lo })
+	merged := append(ranges, cdcSeqRange{})
+	copy(merged[idx+1:], merged[idx:])
+	merged[idx] = r
+
+	out := merged[:0]
+	for _, cur := range merged {
+		if len(out) == 0 || cur.Lo > out[len(out)-1].Hi+1 {
+			out = append(out, cur)
+			continue
+		}
+		if cur.Hi > out[len(out)-1].Hi {
+			out[len(out)-1].Hi = cur.Hi
+		}
+	}
+	return out
+}
+
 func (l *cdcSegmentLog) pendingTxnIDs() []uint64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -514,6 +619,9 @@ func cloneCDCManifest(m *cdcSegmentTxnManifest) *cdcSegmentTxnManifest {
 	cp := *m
 	if len(m.Chunks) > 0 {
 		cp.Chunks = append([]cdcSegmentChunk(nil), m.Chunks...)
+	}
+	if len(m.DiscardRanges) > 0 {
+		cp.DiscardRanges = append([]cdcSeqRange(nil), m.DiscardRanges...)
 	}
 	if len(m.inlineRows) > 0 {
 		cp.inlineRows = make([]cdcSegmentInlineRow, len(m.inlineRows))
@@ -717,14 +825,17 @@ func (c *cdcSegmentCursor) Next() bool {
 		return false
 	}
 	if len(c.manifest.inlineRows) > 0 {
-		if c.inlineIdx >= len(c.manifest.inlineRows) {
-			return false
+		for c.inlineIdx < len(c.manifest.inlineRows) {
+			row := c.manifest.inlineRows[c.inlineIdx]
+			c.inlineIdx++
+			if c.manifest.seqDiscarded(row.seq) {
+				continue
+			}
+			c.seq = row.seq
+			c.data = row.data
+			return true
 		}
-		row := c.manifest.inlineRows[c.inlineIdx]
-		c.inlineIdx++
-		c.seq = row.seq
-		c.data = row.data
-		return true
+		return false
 	}
 	header := make([]byte, cdcSegmentHeaderSize)
 	for c.chunkIdx < len(c.manifest.Chunks) {
@@ -769,6 +880,11 @@ func (c *cdcSegmentCursor) Next() bool {
 			return false
 		}
 		if txnID != c.manifest.TxnID {
+			continue
+		}
+		if c.manifest.seqDiscarded(seq) {
+			// Row of a statement that failed after capturing it; SQLite
+			// rolled the change back, so it must never be sealed/replayed.
 			continue
 		}
 		c.seq = seq

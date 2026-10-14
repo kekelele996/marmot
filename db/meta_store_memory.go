@@ -372,6 +372,11 @@ func (m *MemoryMetaStore) DeleteCapturedRows(txnID uint64) error {
 	return m.pebble.DeleteCapturedRows(txnID)
 }
 
+// DiscardCapturedRowsInRange delegates to Pebble.
+func (m *MemoryMetaStore) DiscardCapturedRowsInRange(txnID, lo, hi uint64) error {
+	return m.pebble.DiscardCapturedRowsInRange(txnID, lo, hi)
+}
+
 // AcquireCDCRowLock uses memory-only lock store.
 func (m *MemoryMetaStore) AcquireCDCRowLock(txnID uint64, tableName, intentKey string) error {
 	return m.lockStore.Acquire(txnID, tableName, intentKey)

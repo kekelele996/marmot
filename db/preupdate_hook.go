@@ -182,6 +182,59 @@ func (s *EphemeralHookSession) QueryContext(ctx context.Context, query string, a
 	return s.tx.QueryContext(ctx, query, args...)
 }
 
+// currentCaptureSeq returns the hook sequence high-water mark: every row
+// captured so far carries seq <= the returned value, and the next hook
+// invocation assigns exactly returned+1. Callers snapshot it around one
+// statement so they can identify and discard that statement's captures on
+// failure.
+func (s *EphemeralHookSession) currentCaptureSeq() uint64 {
+	return atomic.LoadUint64(&s.seq)
+}
+
+// discardStatementCaptures drops the raw hook captures with seq in the
+// inclusive range [lo, hi] - the rows reported while running a statement
+// that then failed. SQLite's statement-level atomicity already rolled the
+// row writes back, but the preupdate hook fired for the rolled-back rows and
+// cannot be undone by SQLite; without this discard the next successful
+// statement's captureAndLockNewRows would pick the rows up and COMMIT would
+// replay writes the failed statement never made (a partial, half-applied
+// action).
+//
+// In-memory rows are removed directly. Rows already spilled to the CDC
+// segment log are excluded through the meta store (logical discard: cursors
+// skip them and they never enter the sealed manifest or the prepare row
+// count). Rows seq < lo belong to earlier, successful statements and are
+// never touched; captureAndLockNewRows' lastProcessedSeq high-water mark
+// therefore stays valid for every later statement.
+func (s *EphemeralHookSession) discardStatementCaptures(lo, hi uint64) error {
+	if hi < lo {
+		return nil
+	}
+
+	s.captureMu.Lock()
+	if len(s.capturedRows) > 0 {
+		kept := s.capturedRows[:0]
+		var capturedBytes int
+		for _, row := range s.capturedRows {
+			if row.seq >= lo && row.seq <= hi {
+				continue
+			}
+			kept = append(kept, row)
+			capturedBytes += len(row.data)
+		}
+		s.capturedRows = kept
+		s.capturedBytes = capturedBytes
+	}
+	s.captureMu.Unlock()
+
+	if s.metaStore != nil && s.txnID != 0 {
+		if err := s.metaStore.DiscardCapturedRowsInRange(s.txnID, lo, hi); err != nil {
+			return fmt.Errorf("discard captured rows %d..%d of txn %d: %w", lo, hi, s.txnID, err)
+		}
+	}
+	return nil
+}
+
 // captureAndLockNewRows processes any rows captured (via hookCallback) since
 // the last call, converting them to IntentEntry and acquiring their CDC row
 // locks immediately - unlike the existing one-shot ProcessCapturedRows/
