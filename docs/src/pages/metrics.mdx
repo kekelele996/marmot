@@ -56,6 +56,7 @@ curl http://localhost:8080/metrics
 | `marmot_v2_rows_affected` | Histogram | - | Number of rows affected per write query |
 | `marmot_v2_rows_returned` | Histogram | - | Number of rows returned per read query |
 | `marmot_v2_mysql_connections` | Gauge | - | Number of active MySQL protocol connections |
+| `marmot_v2_mysql_slow_queries_total` | Counter | `protocol` | Client queries exceeding the slow-query threshold, by path (`text` for COM_QUERY, `prepared` for COM_STMT_EXECUTE) |
 | `marmot_v2_ddl_operations_total` | Counter | `result` | DDL operations by result (success, failed) |
 | `marmot_v2_ddl_lock_wait_seconds` | Histogram | - | Time waiting for DDL lock in seconds |
 

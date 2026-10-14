@@ -55,6 +55,96 @@ func TestValidate_ValidConfig(t *testing.T) {
 	}
 }
 
+func newValidConfigForValidation() *Configuration {
+	return &Configuration{
+		NodeID:  1,
+		DataDir: "./test-data",
+		Cluster: ClusterConfiguration{
+			GRPCPort: 8080,
+		},
+		MySQL: MySQLConfiguration{
+			Enabled: true,
+			Port:    3306,
+		},
+		Replication: ReplicationConfiguration{
+			DefaultWriteConsist: "QUORUM",
+			DefaultReadConsist:  "LOCAL_ONE",
+		},
+		Transaction: TransactionConfiguration{
+			HeartbeatTimeoutSeconds: 10,
+			ConflictWindowSeconds:   10,
+		},
+		ConnectionPool: ConnectionPoolConfiguration{
+			PoolSize: 4,
+		},
+		GRPCClient: GRPCClientConfiguration{
+			KeepaliveTimeSeconds:    10,
+			KeepaliveTimeoutSeconds: 3,
+		},
+		Coordinator: CoordinatorConfiguration{
+			PrepareTimeoutMS: 2000,
+			CommitTimeoutMS:  2000,
+			AbortTimeoutMS:   2000,
+		},
+	}
+}
+
+func TestValidate_MySQLQueryLogDefaultsZeroValues(t *testing.T) {
+	original := Config
+	defer func() { Config = original }()
+
+	Config = newValidConfigForValidation()
+	Config.MySQL.SlowQueryThresholdMS = 0
+	Config.MySQL.QueryLogMaxLength = 0
+
+	if err := Validate(); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if Config.MySQL.SlowQueryThresholdMS != DefaultSlowQueryThresholdMS {
+		t.Errorf("expected default threshold %dms, got %d", DefaultSlowQueryThresholdMS, Config.MySQL.SlowQueryThresholdMS)
+	}
+	if Config.MySQL.QueryLogMaxLength != DefaultQueryLogMaxLength {
+		t.Errorf("expected default max length %d, got %d", DefaultQueryLogMaxLength, Config.MySQL.QueryLogMaxLength)
+	}
+}
+
+func TestValidate_MySQLQueryLogRejectsInvalidValues(t *testing.T) {
+	original := Config
+	defer func() { Config = original }()
+
+	tests := []struct {
+		name      string
+		threshold int
+		maxLength int
+	}{
+		{"negative threshold", -1, DefaultQueryLogMaxLength},
+		{"max length below -1", DefaultSlowQueryThresholdMS, -2},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			Config = newValidConfigForValidation()
+			Config.MySQL.SlowQueryThresholdMS = tc.threshold
+			Config.MySQL.QueryLogMaxLength = tc.maxLength
+			if err := Validate(); err == nil {
+				t.Errorf("expected validation error for threshold=%d maxLength=%d", tc.threshold, tc.maxLength)
+			}
+		})
+	}
+}
+
+func TestValidate_MySQLQueryLogAllowsUnlimitedLength(t *testing.T) {
+	original := Config
+	defer func() { Config = original }()
+
+	Config = newValidConfigForValidation()
+	Config.MySQL.QueryLogMaxLength = -1
+
+	if err := Validate(); err != nil {
+		t.Fatalf("expected -1 (unlimited) to be accepted, got: %v", err)
+	}
+}
+
 func TestValidate_InvalidGRPCPort(t *testing.T) {
 	original := Config
 	defer func() { Config = original }()

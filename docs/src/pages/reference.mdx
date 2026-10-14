@@ -204,7 +204,16 @@ port = 3306
 max_connections = 1000
 local_infile_enabled = true         # Enable LOAD DATA LOCAL INFILE
 auto_id_mode = "compact"  # "compact" (53-bit, default) or "extended" (64-bit)
+query_log_enabled = false           # Log every query at info level (source + SQL + duration)
+slow_query_log_enabled = true       # Warn for queries at/over the threshold (default: on)
+slow_query_threshold_ms = 200       # 0 = use the default 200ms
+query_log_max_length = 2048         # Max SQL runes in log records (-1 = unlimited)
 ```
+
+**Request Logging and Slow Queries:**
+- Every completed client query (`COM_QUERY` / `COM_STMT_EXECUTE`) is recorded with its source (`remote` client address and `conn_id`), database, protocol path, SQL text and `duration_ms`; the record covers handler execution plus response writing.
+- Records are emitted at debug level by default (visible with `logging.verbose = true`) and at info level when `query_log_enabled = true`.
+- Queries at or over `slow_query_threshold_ms` are additionally logged at warn level as `Slow query detected` and counted in the `marmot_v2_mysql_slow_queries_total` metric (label `protocol`: `text` / `prepared`), making obviously slow requests easy to find without enabling verbose logging.
 
 **Auto ID Mode:**
 - `"compact"` (default): Generates 53-bit IDs that are safe for all clients including JavaScript (`Number.MAX_SAFE_INTEGER`). Format: 41 bits timestamp + 6 bits node + 6 bits sequence. Supports ~69 years from epoch (Jan 2, 2025) with 64K IDs/sec per node.

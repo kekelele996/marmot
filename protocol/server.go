@@ -18,7 +18,22 @@ import (
 	"github.com/maxpert/marmot/protocol/query"
 	"github.com/maxpert/marmot/telemetry"
 	"github.com/puzpuzpuz/xsync/v3"
+	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+)
+
+// Default per-request logging settings used before SetQueryLogConfig is
+// called; they mirror cfg.DefaultSlowQueryThresholdMS / cfg.DefaultQueryLogMaxLength
+// so that the protocol package does not depend on the cfg package.
+const (
+	defaultSlowQueryThreshold = 200 * time.Millisecond
+	defaultQueryLogMaxLength  = 2048
+)
+
+// Protocol-path labels used in per-request log records and slow-query metrics.
+const (
+	queryProtocolText     = "text"     // COM_QUERY
+	queryProtocolPrepared = "prepared" // COM_STMT_EXECUTE
 )
 
 // bufferPool provides reusable bytes.Buffer instances to reduce allocations
@@ -55,6 +70,13 @@ type MySQLServer struct {
 	connIDLock     sync.Mutex
 	activeConns    *xsync.MapOf[uint64, net.Conn]
 	draining       atomic.Bool
+
+	// Per-request logging configuration (see SetQueryLogConfig). With the
+	// defaults slow client queries are surfaced without extra setup.
+	queryLogEnabled      bool
+	slowQueryLogEnabled  bool
+	slowQueryThreshold   time.Duration
+	queryLogMaxSQLLength int
 }
 
 // SessionTransaction holds transaction state for explicit BEGIN/COMMIT
@@ -254,19 +276,36 @@ type ColumnDef struct {
 // NewMySQLServer creates a new MySQL server
 func NewMySQLServer(tcpAddress, unixSocket string, unixSocketPerm os.FileMode, handler ConnectionHandler) *MySQLServer {
 	return &MySQLServer{
-		tcpAddress:     tcpAddress,
-		unixSocket:     unixSocket,
-		unixSocketPerm: unixSocketPerm,
-		localInfile:    true,
-		quit:           make(chan struct{}),
-		handler:        handler,
-		activeConns:    xsync.NewMapOf[uint64, net.Conn](),
+		tcpAddress:           tcpAddress,
+		unixSocket:           unixSocket,
+		unixSocketPerm:       unixSocketPerm,
+		localInfile:          true,
+		quit:                 make(chan struct{}),
+		handler:              handler,
+		activeConns:          xsync.NewMapOf[uint64, net.Conn](),
+		slowQueryLogEnabled:  true,
+		slowQueryThreshold:   defaultSlowQueryThreshold,
+		queryLogMaxSQLLength: defaultQueryLogMaxLength,
 	}
 }
 
 // SetLocalInfileEnabled enables/disables LOAD DATA LOCAL INFILE protocol handling.
 func (s *MySQLServer) SetLocalInfileEnabled(enabled bool) {
 	s.localInfile = enabled
+}
+
+// SetQueryLogConfig configures per-request logging.
+//   - queryLogEnabled: every completed query is logged at info level with its
+//     source (remote address + connection ID), SQL text and duration. When
+//     false the same record is emitted at debug level.
+//   - slowQueryLogEnabled: queries taking at least slowQueryThreshold are
+//     additionally logged at warn level and counted in the slow-query metric.
+//   - maxSQLLength truncates logged SQL text (in runes); -1 keeps it whole.
+func (s *MySQLServer) SetQueryLogConfig(queryLogEnabled, slowQueryLogEnabled bool, slowQueryThreshold time.Duration, maxSQLLength int) {
+	s.queryLogEnabled = queryLogEnabled
+	s.slowQueryLogEnabled = slowQueryLogEnabled
+	s.slowQueryThreshold = slowQueryThreshold
+	s.queryLogMaxSQLLength = maxSQLLength
 }
 
 // Start starts the MySQL server
@@ -554,8 +593,18 @@ func (s *MySQLServer) handleConnection(conn net.Conn) {
 }
 
 func (s *MySQLServer) processQuery(conn net.Conn, session *ConnectionSession, query string) {
+	queryStart := time.Now()
+	var rs *ResultSet
+	var queryErr error
+	defer func() {
+		// Timing covers handling plus response writing, so a slow client or a
+		// slow handler both show up here.
+		s.observeQuery(session, query, queryProtocolText, 0, queryStart, rs, queryErr)
+	}()
+
 	if isLoadDataStatement(query) {
 		if err := s.processLoadDataQuery(conn, session, query); err != nil {
+			queryErr = err
 			_ = s.writeMySQLErr(conn, 1, err)
 		}
 		return
@@ -564,9 +613,9 @@ func (s *MySQLServer) processQuery(conn net.Conn, session *ConnectionSession, qu
 	// Parse first to check validity (optional, but good for sanity)
 	// For now, we pass directly to handler which will use the parser/coordinator
 
-	rs, err := s.handler.HandleQuery(session, query, nil)
-	if err != nil {
-		_ = s.writeMySQLErr(conn, 1, err)
+	rs, queryErr = s.handler.HandleQuery(session, query, nil)
+	if queryErr != nil {
+		_ = s.writeMySQLErr(conn, 1, queryErr)
 		return
 	}
 	if !rs.HasResultSet() {
@@ -584,6 +633,84 @@ func (s *MySQLServer) processQuery(conn net.Conn, session *ConnectionSession, qu
 
 	// Send Result Set
 	_ = s.writeResultSet(conn, 1, session, rs)
+}
+
+// observeQuery emits one per-request record carrying the request source
+// (remote address and connection ID), database, SQL text and handling
+// duration. Records go out at debug level by default, info level when
+// per-query logging is enabled; a query at or over the slow-query threshold
+// is additionally emitted at warn level with the threshold attached and
+// counted in the mysql_slow_queries_total metric, so obviously slow requests
+// are easy to spot and aggregate.
+func (s *MySQLServer) observeQuery(
+	session *ConnectionSession,
+	query string,
+	protocolPath string,
+	paramCount int,
+	start time.Time,
+	rs *ResultSet,
+	err error,
+) {
+	elapsed := time.Since(start)
+	slow := s.slowQueryLogEnabled && s.slowQueryThreshold > 0 && elapsed >= s.slowQueryThreshold
+	if slow {
+		telemetry.MySQLSlowQueriesTotal.With(protocolPath).Inc()
+	}
+
+	var event *zerolog.Event
+	switch {
+	case slow:
+		event = log.Warn()
+	case s.queryLogEnabled:
+		event = log.Info()
+	default:
+		event = log.Debug()
+	}
+
+	event.
+		Uint64("conn_id", session.ConnID).
+		Str("remote", session.RemoteAddr).
+		Str("database", session.CurrentDatabase).
+		Str("protocol", protocolPath).
+		Dur("duration", elapsed).
+		Int64("duration_ms", elapsed.Milliseconds()).
+		Str("query", s.truncateQuery(query))
+
+	if paramCount > 0 {
+		event.Int("params", paramCount)
+	}
+	if rs != nil {
+		if rs.HasResultSet() {
+			event.Int("rows_returned", len(rs.Rows))
+		} else {
+			event.Int64("rows_affected", rs.RowsAffected)
+		}
+	}
+	if err != nil {
+		event.Err(err)
+	}
+
+	if slow {
+		event.
+			Dur("threshold", s.slowQueryThreshold).
+			Msg("Slow query detected")
+		return
+	}
+	event.Msg("Query executed")
+}
+
+// truncateQuery caps SQL text in log records to queryLogMaxSQLLength runes,
+// cutting on a rune boundary so multibyte text stays valid. A negative limit
+// disables truncation.
+func (s *MySQLServer) truncateQuery(query string) string {
+	if s.queryLogMaxSQLLength < 0 {
+		return query
+	}
+	runes := []rune(query)
+	if len(runes) <= s.queryLogMaxSQLLength {
+		return query
+	}
+	return string(runes[:s.queryLogMaxSQLLength]) + "...(truncated)"
 }
 
 // --- Packet Writing Helpers ---
@@ -1423,11 +1550,20 @@ func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSessio
 
 	// Execute query with params passed to handler (no string interpolation!)
 	// The handler transpiles the client's SQL as it does a text query.
-	rs, err := s.handler.HandleQuery(session, stmt.Query, params)
-	if err != nil {
-		_ = s.writeMySQLErr(conn, 1, err)
+	queryStart := time.Now()
+	var execRS *ResultSet
+	var execErr error
+	defer func() {
+		// Timing covers handling plus response writing, as for COM_QUERY.
+		s.observeQuery(session, stmt.Query, queryProtocolPrepared, len(params), queryStart, execRS, execErr)
+	}()
+
+	execRS, execErr = s.handler.HandleQuery(session, stmt.Query, params)
+	if execErr != nil {
+		_ = s.writeMySQLErr(conn, 1, execErr)
 		return
 	}
+	rs := execRS
 
 	// A prepared statement answers as its text form does: a result set when
 	// the answer carries one (INFORMATION_SCHEMA, SHOW and the like), an OK

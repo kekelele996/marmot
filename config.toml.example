@@ -306,6 +306,27 @@ local_infile_enabled = true
 # "extended" = 64-bit HLC-based IDs for maximum uniqueness
 auto_id_mode = "compact"
 
+# Log every completed client query at info level, recording its source
+# (remote address + connection ID), database, SQL text and duration.
+# When false (default) the same record is logged at debug level, so it is
+# only visible with logging.verbose = true.
+query_log_enabled = false
+
+# Log queries whose handling takes at least slow_query_threshold_ms at warn
+# level ("Slow query detected"), including the source connection and SQL
+# text, so obviously slow requests stand out without enabling verbose logging.
+# Slow queries are also counted in the marmot_v2_mysql_slow_queries_total metric.
+slow_query_log_enabled = true
+
+# Threshold in milliseconds above which a query is considered slow.
+# 0 = use the default (200ms).
+slow_query_threshold_ms = 200
+
+# Maximum SQL text length (in runes) kept in query/slow-query log records;
+# longer statements are truncated with a "...(truncated)" marker.
+# 0 = use the default (2048), -1 = never truncate.
+query_log_max_length = 2048
+
 # ==============================================================================
 # SNAPSHOT (Streaming recovery for new/lagging nodes)
 # ==============================================================================

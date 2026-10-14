@@ -196,6 +196,12 @@ func Run() {
 		replica.handler,
 	)
 	mysqlServer.SetLocalInfileEnabled(cfg.Config.MySQL.LocalInfile)
+	mysqlServer.SetQueryLogConfig(
+		cfg.Config.MySQL.QueryLogEnabled,
+		cfg.Config.MySQL.SlowQueryLogEnabled,
+		time.Duration(cfg.Config.MySQL.SlowQueryThresholdMS)*time.Millisecond,
+		cfg.Config.MySQL.QueryLogMaxLength,
+	)
 
 	if err := mysqlServer.Start(); err != nil {
 		log.Fatal().Err(err).Msg("Failed to start MySQL server")

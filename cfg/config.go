@@ -109,7 +109,32 @@ type MySQLConfiguration struct {
 	AutoIDMode     string `toml:"auto_id_mode"`         // "compact" (default, 53-bit) or "extended" (64-bit)
 	UnixSocket     string `toml:"unix_socket"`          // Path to Unix socket (empty = disabled)
 	UnixSocketPerm int    `toml:"unix_socket_perm"`     // Permissions, default 0660
+
+	// QueryLogEnabled logs every completed client query at info level,
+	// recording the source (remote address and connection ID), SQL text and
+	// duration. When false (the default) the same record is emitted at debug
+	// level and is only visible with verbose logging.
+	QueryLogEnabled bool `toml:"query_log_enabled"`
+
+	// SlowQueryLogEnabled emits a warn-level record for each query whose
+	// handling takes at least SlowQueryThresholdMS, so obviously slow requests
+	// stand out in normal (non-verbose) logs. Default: true.
+	SlowQueryLogEnabled bool `toml:"slow_query_log_enabled"`
+
+	// SlowQueryThresholdMS is the minimum query duration (in milliseconds)
+	// that qualifies as a slow query. 0 means "use the default" (200ms).
+	SlowQueryThresholdMS int `toml:"slow_query_threshold_ms"`
+
+	// QueryLogMaxLength truncates SQL text in query/slow-query log records to
+	// at most this many runes (0 = use the default 2048, -1 = no truncation).
+	QueryLogMaxLength int `toml:"query_log_max_length"`
 }
+
+// Defaults for MySQLConfiguration request logging.
+const (
+	DefaultSlowQueryThresholdMS = 200
+	DefaultQueryLogMaxLength    = 2048
+)
 
 // LoggingConfiguration controls logging behavior
 type LoggingConfiguration struct {
@@ -387,13 +412,16 @@ var Config = &Configuration{
 	},
 
 	MySQL: MySQLConfiguration{
-		Enabled:        true,
-		BindAddress:    "0.0.0.0",
-		Port:           3306,
-		MaxConnections: 1000,
-		LocalInfile:    true,
-		AutoIDMode:     "compact", // Default to compact 53-bit IDs
-		UnixSocketPerm: 0660,
+		Enabled:              true,
+		BindAddress:          "0.0.0.0",
+		Port:                 3306,
+		MaxConnections:       1000,
+		LocalInfile:          true,
+		AutoIDMode:           "compact", // Default to compact 53-bit IDs
+		UnixSocketPerm:       0660,
+		SlowQueryLogEnabled:  true, // Surface slow client queries in normal logs
+		SlowQueryThresholdMS: DefaultSlowQueryThresholdMS,
+		QueryLogMaxLength:    DefaultQueryLogMaxLength,
 	},
 
 	Logging: LoggingConfiguration{
@@ -600,6 +628,22 @@ func Validate() error {
 
 	if Config.MySQL.Enabled && (Config.MySQL.Port < 1 || Config.MySQL.Port > 65535) {
 		return fmt.Errorf("invalid MySQL port: %d", Config.MySQL.Port)
+	}
+
+	// Normalize request-logging settings: an unset (0) threshold or length
+	// means "use the default"; only the length may be negative, where -1
+	// disables truncation.
+	if Config.MySQL.SlowQueryThresholdMS == 0 {
+		Config.MySQL.SlowQueryThresholdMS = DefaultSlowQueryThresholdMS
+	}
+	if Config.MySQL.SlowQueryThresholdMS < 0 {
+		return fmt.Errorf("mysql.slow_query_threshold_ms must be >= 0 (0 = default %dms)", DefaultSlowQueryThresholdMS)
+	}
+	if Config.MySQL.QueryLogMaxLength == 0 {
+		Config.MySQL.QueryLogMaxLength = DefaultQueryLogMaxLength
+	}
+	if Config.MySQL.QueryLogMaxLength < -1 {
+		return fmt.Errorf("mysql.query_log_max_length must be >= 0 (0 = default %d, -1 = unlimited)", DefaultQueryLogMaxLength)
 	}
 
 	// Validate auto_id_mode

@@ -103,6 +103,12 @@ var (
 
 	// DDLLockWaitSeconds measures time waiting for DDL lock
 	DDLLockWaitSeconds Histogram = NoopStat{}
+
+	// MySQLSlowQueriesTotal counts client queries whose handling exceeded the
+	// configured slow-query threshold, broken down by whether the query ran
+	// through the text protocol (COM_QUERY) or a prepared statement
+	// (COM_STMT_EXECUTE).
+	MySQLSlowQueriesTotal CounterVec = noopCounterVec{}
 )
 
 // Anti-Entropy Metrics
@@ -279,6 +285,11 @@ func InitMetrics() {
 		"ddl_lock_wait_seconds",
 		"Time waiting for DDL lock in seconds",
 		TwoPCBuckets,
+	)
+	MySQLSlowQueriesTotal = NewCounterVec(
+		"mysql_slow_queries_total",
+		"Total client queries exceeding the slow-query threshold by protocol path",
+		[]string{"protocol"},
 	)
 
 	// Anti-Entropy Metrics
