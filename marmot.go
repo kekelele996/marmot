@@ -27,6 +27,7 @@ import (
 	"github.com/maxpert/marmot/publisher"
 	"github.com/maxpert/marmot/replica"
 	"github.com/maxpert/marmot/telemetry"
+	"github.com/maxpert/marmot/ttl"
 
 	// Register CDC sink and transformer factories via init()
 	_ "github.com/maxpert/marmot/publisher/sink"
@@ -44,6 +45,25 @@ type publisherAdapter struct {
 
 func (p *publisherAdapter) AppendCDC(txnID uint64, database string, entries []common.CDCEntry, commitTSNanos int64, nodeID uint64) error {
 	return p.registry.AppendCDC(txnID, database, entries, commitTSNanos, nodeID)
+}
+
+// ttlMembership adapts the gRPC node registry to ttl.Membership: the TTL
+// sweeper's owner election needs the current ALIVE members, self included.
+type ttlMembership struct {
+	registry *marmotgrpc.NodeRegistry
+}
+
+func (m *ttlMembership) LocalNodeID() uint64 {
+	return m.registry.GetLocalNodeID()
+}
+
+func (m *ttlMembership) AliveNodeIDs() []uint64 {
+	nodes := m.registry.GetAlive()
+	ids := make([]uint64, 0, len(nodes))
+	for _, n := range nodes {
+		ids = append(ids, n.NodeId)
+	}
+	return ids
 }
 
 // dbManagerAdapter adapts DatabaseManager to telemetry.DatabaseLister
@@ -554,6 +574,26 @@ func main() {
 		return
 	}
 
+	// Start the background TTL sweeper. Only the lowest-numbered ALIVE node
+	// sweeps per round; its deletes are ordinary replicated writes, so every
+	// node converges to the same rows. The sweeper is inert until a table
+	// opts in via COMMENT='marmot:ttl=<column>'.
+	var ttlSweeper *ttl.Sweeper
+	if cfg.Config.TTL.Enabled {
+		ttlSweeper = ttl.NewSweeper(
+			ttl.Config{
+				Interval:   time.Duration(cfg.Config.TTL.SweepIntervalSeconds) * time.Second,
+				BatchSize:  cfg.Config.TTL.BatchSize,
+				BatchPause: time.Duration(cfg.Config.TTL.BatchPauseMS) * time.Millisecond,
+			},
+			cfg.Config.NodeID,
+			dbMgr,
+			handler,
+			&ttlMembership{registry: grpcServer.GetNodeRegistry()},
+		)
+		ttlSweeper.Start(context.Background())
+	}
+
 	// Now that all services are initialized and running, handle node state
 	if isJoiningCluster {
 		// Start promotion checker to automatically transition from JOINING → ALIVE
@@ -595,6 +635,7 @@ func main() {
 		forwardSessMgr:     forwardSessionMgr,
 		coordinatorHandler: handler,
 		vecIndexMgr:        vecIndexMgr,
+		ttlSweeper:         ttlSweeper,
 		gracePeriod:        cfg.Config.Cluster.GetShutdownGracePeriod(),
 	}
 

@@ -10,6 +10,7 @@ import (
 	"github.com/maxpert/marmot/protocol"
 	"github.com/maxpert/marmot/publisher"
 	"github.com/maxpert/marmot/telemetry"
+	"github.com/maxpert/marmot/ttl"
 	"github.com/rs/zerolog/log"
 )
 
@@ -29,6 +30,7 @@ type ShutdownOrchestrator struct {
 	forwardSessMgr     *marmotgrpc.ForwardSessionManager
 	coordinatorHandler *coordinator.CoordinatorHandler
 	vecIndexMgr        *db.VectorIndexManager
+	ttlSweeper         *ttl.Sweeper
 	gracePeriod        time.Duration
 }
 
@@ -79,6 +81,15 @@ func (o *ShutdownOrchestrator) Shutdown() {
 	o.runStep("stop anti-entropy", func() {
 		o.antiEntropy.Stop()
 	})
+
+	// Stop the TTL sweeper — no further replicated expiry deletes. Draining
+	// (set above) already makes rounds no-op; Stop cancels the current batch's
+	// pauses and waits for it to leave the write path.
+	if o.ttlSweeper != nil {
+		o.runStep("stop TTL sweeper", func() {
+			o.ttlSweeper.Stop()
+		})
+	}
 
 	if o.forwardSessMgr != nil {
 		o.runStep("stop forward session manager", func() {

@@ -266,6 +266,44 @@ For UPDATE and DELETE operations, Marmot automatically extracts row keys:
 - Falls back to ROWID for tables without explicit primary key
 - Handles composite primary keys correctly
 
+## Row Expiry (TTL)
+
+Temporary data can expire automatically: a table names the column holding each row's
+absolute expiry time, and a background sweeper deletes expired rows in bounded batches.
+
+```sql
+CREATE TABLE sessions (
+    id         INTEGER PRIMARY KEY,
+    expires_at INTEGER NOT NULL          -- Unix epoch seconds
+) COMMENT='marmot:ttl=expires_at';
+```
+
+- The expiry column is an integer of **Unix epoch seconds**, or a UTC `YYYY-MM-DD HH:MM:SS`
+  TEXT column. Rows whose value is in the past are deleted; `NULL` means "never expires".
+  Refreshing a row's lifetime is an ordinary UPDATE of its expiry column.
+- The directive rides the replicated `CREATE TABLE` text (as a hidden marker), so every
+  node derives the same policy with no extra metadata channel. It is hidden from
+  `SHOW CREATE TABLE`.
+- Exactly one node sweeps each round: the lowest-numbered currently-ALIVE member. If it
+  leaves mid-sweep, the next owner repeats bounded, idempotent deletes.
+- Every delete is a normal replicated transaction (2PC + CDC, per-row LWW tombstones),
+  so all nodes converge to the same rows; a node that was down catches the deletes up
+  through anti-entropy. Cleanup never takes a DDL lock or a long write transaction:
+  batches are capped (`ttl.batch_size`, default 500) with a yield between them
+  (`ttl.batch_pause_ms`, default 100), and the loop idles while the node drains for
+  shutdown.
+
+```toml
+[ttl]
+enabled = true                # default: on; inert until a table opts in
+sweep_interval_seconds = 60
+batch_size = 500
+batch_pause_ms = 100
+```
+
+WITHOUT ROWID tables are not swept in this release; give the expiry column an index for
+cheap sweep scans. Changing the policy currently requires recreating the table.
+
 ## CDC Publisher
 
 Marmot can publish CDC events to external messaging systems, enabling real-time data pipelines, analytics, and event-driven architectures. Events follow the **[Debezium](https://debezium.io/) specification** for maximum compatibility with existing CDC tooling.

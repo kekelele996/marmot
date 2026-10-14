@@ -1,8 +1,10 @@
 package transform
 
 import (
+	"fmt"
 	"strings"
 
+	"github.com/maxpert/marmot/protocol/query/transform/ttlmarker"
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
@@ -49,7 +51,17 @@ func (r *CreateTableRule) Transform(stmt sqlparser.Statement, params []interface
 
 	create.TableSpec.Indexes = remainingIndexes
 
-	// Clear MySQL-specific table options (ENGINE, CHARSET, COLLATE)
+	// A table COMMENT may carry the row-expiry directive (marmot:ttl=<column>).
+	// Extract it before the MySQL-specific table options are dropped, and
+	// validate it names a column this CREATE declares.
+	ttlColumn := ttlColumnFromOptions(create.TableSpec.Options)
+	if ttlColumn != "" && !createDeclaresColumn(create, ttlColumn) {
+		return nil, fmt.Errorf(
+			"table COMMENT declares %s%q but the table has no column named %q",
+			ttlmarker.DirectivePrefix, ttlColumn, ttlColumn)
+	}
+
+	// Clear MySQL-specific table options (ENGINE, CHARSET, COLLATE, COMMENT)
 	create.TableSpec.Options = nil
 
 	// Process columns: strip MySQL-specific options
@@ -61,6 +73,13 @@ func (r *CreateTableRule) Transform(stmt sqlparser.Statement, params []interface
 	var results []TranspiledStatement
 
 	mainSQL := serializer.Serialize(create)
+	if ttlColumn != "" {
+		// The marker rides the replicated DDL text into every node's
+		// sqlite_master.sql. SQLite drops comments after the statement's
+		// final token, so the marker has to sit BETWEEN tokens: immediately
+		// before the ')' that closes the table spec.
+		mainSQL = insertTableMarker(mainSQL, ttlmarker.Encode(ttlColumn))
+	}
 	results = append(results, TranspiledStatement{SQL: mainSQL, Params: params})
 
 	// Add CREATE INDEX statements (no params for DDL)
@@ -92,6 +111,47 @@ func (r *CreateTableRule) shouldExtractIndex(idx *sqlparser.IndexDefinition) boo
 	}
 
 	return true
+}
+
+// insertTableMarker places a table-level marker comment immediately before the
+// ')' that closes the CREATE TABLE spec. It cannot trail the statement: SQLite
+// stores sqlite_master.sql with trailing comments removed, while a comment
+// between two tokens survives verbatim.
+func insertTableMarker(createSQL, marker string) string {
+	trimmed := strings.TrimRight(createSQL, " \t\r\n;")
+	if !strings.HasSuffix(trimmed, ")") {
+		// An unfamiliar serializer shape: fall back to appending rather than
+		// corrupting the statement.
+		return trimmed + " " + marker
+	}
+	return trimmed[:len(trimmed)-1] + " " + marker + ")"
+}
+
+// ttlColumnFromOptions reads the marmot:ttl=&lt;column&gt; directive from a CREATE
+// TABLE's COMMENT table option, if it carries one. Every other MySQL table
+// option is irrelevant to TTL and is dropped later along with the whole
+// option list.
+func ttlColumnFromOptions(opts sqlparser.TableOptions) string {
+	for _, opt := range opts {
+		if opt == nil || opt.Value == nil || !strings.EqualFold(opt.Name, "comment") {
+			continue
+		}
+		if col, ok := ttlmarker.ExtractDirective(opt.Value.Val); ok {
+			return col
+		}
+	}
+	return ""
+}
+
+// createDeclaresColumn reports whether create declares a column of the given
+// name. Identifiers compare case-insensitively, the way SQLite resolves them.
+func createDeclaresColumn(create *sqlparser.CreateTable, column string) bool {
+	for _, col := range create.TableSpec.Columns {
+		if strings.EqualFold(col.Name.String(), column) {
+			return true
+		}
+	}
+	return false
 }
 
 // buildCreateIndex generates a SQLite CREATE INDEX statement for the given index definition.

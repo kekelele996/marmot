@@ -271,6 +271,28 @@ lock_lease_seconds = 30
 enable_idempotent = true
 
 # ==============================================================================
+# TTL / ROW EXPIRY
+# ==============================================================================
+
+[ttl]
+# Background sweep of expired rows. A table opts in with a COMMENT directive at
+# creation:
+#   CREATE TABLE sessions (
+#     id INTEGER PRIMARY KEY,
+#     expires_at INTEGER NOT NULL          -- Unix epoch seconds ...
+#   ) COMMENT='marmot:ttl=expires_at';    -- ... or UTC 'YYYY-MM-DD HH:MM:SS' TEXT
+#
+# Only the lowest-numbered ALIVE node sweeps each round, and every delete is an
+# ordinary replicated transaction, so all nodes converge to the same rows. NULL
+# never expires. WITHOUT ROWID tables are not swept.
+#
+# Enabled by default; the loop is inert until a table opts in.
+#enabled = true
+#sweep_interval_seconds = 60   # How often the sweeper node scans
+#batch_size = 500             # Max rows deleted per replicated transaction
+#batch_pause_ms = 100         # Pause between batches, yielding to client writes
+
+# ==============================================================================
 # QUERY PIPELINE
 # ==============================================================================
 

@@ -268,6 +268,28 @@ type VectorIndexConfiguration struct {
 	DataDir string `toml:"data_dir"`
 }
 
+// TTLConfiguration controls background expiry cleanup (row time-to-live).
+//
+// A table names the column holding each row's absolute expiry time with a
+// COMMENT='marmot:ttl=<column>' table option on CREATE TABLE. One cluster
+// member at a time - the lowest-numbered ALIVE node - sweeps expired rows in
+// bounded batches; the deletes are ordinary replicated transactions, so every
+// node converges to the same rows. The sweeper is inert until a table opts in.
+type TTLConfiguration struct {
+	// Enabled turns the background sweeper on (default: true).
+	Enabled bool `toml:"enabled"`
+	// SweepIntervalSeconds is how often the sweeper node scans for expired
+	// rows (default: 60).
+	SweepIntervalSeconds int `toml:"sweep_interval_seconds"`
+	// BatchSize is the most rows one sweep transaction deletes (default:
+	// 500). Bounded batches are what keeps cleanup from blocking normal
+	// writes.
+	BatchSize int `toml:"batch_size"`
+	// BatchPauseMS is the pause between batches of one table, yielding the
+	// single SQLite writer to client traffic (default: 100).
+	BatchPauseMS int `toml:"batch_pause_ms"`
+}
+
 // Configuration is the main configuration structure
 type Configuration struct {
 	NodeID  uint64 `toml:"node_id"`
@@ -288,8 +310,9 @@ type Configuration struct {
 	Replica        ReplicaConfiguration        `toml:"replica"`
 	Publisher      PublisherConfiguration      `toml:"publisher"`
 	BatchCommit    BatchCommitConfiguration    `toml:"batch_commit"`
-	Extensions     ExtensionConfiguration      `toml:"extensions"`
+	Extensions     ExtensionConfiguration     `toml:"extensions"`
 	VectorIndex    VectorIndexConfiguration    `toml:"vector_index"`
+	TTL            TTLConfiguration            `toml:"ttl"`
 }
 
 // Command line flags
@@ -441,6 +464,13 @@ var Config = &Configuration{
 
 	VectorIndex: VectorIndexConfiguration{
 		Enabled: false,
+	},
+
+	TTL: TTLConfiguration{
+		Enabled:              true,
+		SweepIntervalSeconds: 60,
+		BatchSize:            500,
+		BatchPauseMS:         100,
 	},
 }
 
@@ -896,6 +926,25 @@ func Validate() error {
 				return fmt.Errorf("publisher.sinks[%d].topic_prefix cannot be empty", i)
 			}
 		}
+	}
+
+	// Validate TTL sweeper configuration. Zero means "use the default", the
+	// same convention lock_wait_timeout_seconds and the replica discovery
+	// intervals use; negatives are rejected.
+	if Config.TTL.SweepIntervalSeconds == 0 {
+		Config.TTL.SweepIntervalSeconds = 60
+	}
+	if Config.TTL.BatchSize == 0 {
+		Config.TTL.BatchSize = 500
+	}
+	if Config.TTL.SweepIntervalSeconds < 0 {
+		return fmt.Errorf("ttl.sweep_interval_seconds must be >= 0")
+	}
+	if Config.TTL.BatchSize < 0 {
+		return fmt.Errorf("ttl.batch_size must be >= 0")
+	}
+	if Config.TTL.BatchPauseMS < 0 {
+		return fmt.Errorf("ttl.batch_pause_ms must be >= 0")
 	}
 
 	return nil
