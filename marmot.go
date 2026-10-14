@@ -307,6 +307,7 @@ func main() {
 
 	// Register admin HTTP endpoints under /admin
 	adminHandlers := admin.NewAdminHandlers(grpcServer, dbMgr)
+	adminHandlers.SetClient(client)
 	admin.RegisterRoutes(grpcServer.GetHTTPMux(), adminHandlers)
 
 	// Import existing databases from data_dir if:

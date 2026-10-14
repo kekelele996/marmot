@@ -22,6 +22,7 @@ type AdminHandlers struct {
 	server      *grpc.Server
 	dbManager   *db.DatabaseManager
 	antiEntropy *grpc.AntiEntropyService // set once anti-entropy is constructed (SetAntiEntropy); nil until then
+	client      *grpc.Client             // peer connections for cluster-wide fan-outs (SetClient); nil until wired
 }
 
 // NewAdminHandlers creates a new AdminHandlers instance
@@ -30,6 +31,13 @@ func NewAdminHandlers(server *grpc.Server, dbManager *db.DatabaseManager) *Admin
 		server:    server,
 		dbManager: dbManager,
 	}
+}
+
+// SetClient wires the gRPC peer client into the admin surface, used by the
+// cluster-wide consistency check fan-out. marmot.go calls this once the
+// gossip client is constructed (after NewAdminHandlers).
+func (h *AdminHandlers) SetClient(client *grpc.Client) {
+	h.client = client
 }
 
 // SetAntiEntropy wires the running AntiEntropyService into the admin

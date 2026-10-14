@@ -268,6 +268,58 @@ only the ones that are reachable:
 - A node removed through `/admin/cluster/remove` stops counting at once: its
   pull positions are dropped, and it no longer holds back GC on any node.
 
+## Cluster Data Consistency Check
+
+To verify that the ALIVE nodes actually hold identical data - and, when they do not, to see the exact node and
+record that disagrees instead of only a suspicion - run the read-only check on any node:
+
+```bash
+curl -H "X-Marmot-Secret: $SECRET" \
+  "http://node1:8080/admin/cluster/consistency?database=app"
+```
+
+It compares every ALIVE member (plus the node answering) and reports `200` with `consistent: true`, or `409`
+with the details. Parameters:
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `database` | every local database | One database name. |
+| `tables` | all tables | Comma-separated whitelist of table names. |
+| `include_values` | `true` | Attach each node's actual values for the first 50 differing keys. |
+| `max_mismatches` | `200` | Differing rows reported per table (at most 1000). |
+| `alive_only` | `true` | Set `false` to also try non-ALIVE members; unreachable ones are listed in `unreachable_nodes`. |
+| `timeout_seconds` | `30` | Per-fan-out deadline (at most 300). |
+
+The check is a scatter/gather over three levels: each node computes a per-table digest (row count plus a hash of
+every row in primary-key order); only tables whose digest differs are compared row by row (primary key plus a
+per-row hash); only then are the actual values fetched. A mismatching table therefore reports findings such as:
+
+```json
+{
+  "table": "users",
+  "status": "mismatch",
+  "primary_key": ["id"],
+  "mismatches": [{
+    "key_text": "i:7",
+    "kind": "value_mismatch",
+    "nodes": [
+      {"node_id": 1, "present": true, "hash": "9f…", "values": {"id": "i:7", "name": "s:alice"}},
+      {"node_id": 2, "present": true, "hash": "1c…", "values": {"id": "i:7", "name": "s:ALICE"}}
+    ]
+  }]
+}
+```
+
+`kind` is `value_mismatch` (the key exists everywhere with different content), `missing_row` (some nodes do not
+have the key), `missing_table`, or `schema_mismatch` (nodes disagree on the table's columns). Values render
+deterministically: `NULL`, `i:<int>`, `f:<float>`, `s:<text>`, `b:<hex blob>`. Marmot protocol tables
+(`__marmot*`), SQLite shadow tables and virtual tables are excluded.
+
+The check reads committed rows without taking a cross-node snapshot: run it against a **quiescent cluster**, or
+writes still replicating can surface as transient differences - rerun and they disappear. A partial run (an
+unreachable node, an RPC failure, or a table whose comparison hit the row cap) reports `complete: false` rather
+than a clean verdict.
+
 ## Prometheus Metrics
 
 ```toml

@@ -81,6 +81,24 @@ service MarmotService {
   // Lists this node's database registry, tombstones included.
   rpc ListDatabaseRegistry(DatabaseRegistryRequest) returns (DatabaseRegistryResponse);
 
+  // ===== DATA CONSISTENCY CHECK =====
+  // Per-table content digests of one local database (row count plus a
+  // deterministic hash of every row), so a coordinator can tell which
+  // tables differ between nodes before fetching any row-level detail.
+  rpc GetTableDigests(ConsistencyDigestRequest)
+      returns (ConsistencyDigestResponse);
+
+  // One page of (primary key, per-row hash) pairs for a single table in
+  // deterministic key order. Fetched only for tables whose digest differs,
+  // so the differing records themselves can be pinpointed.
+  rpc GetRowHashes(ConsistencyRowHashRequest)
+      returns (ConsistencyRowHashResponse);
+
+  // The rendered values of a batch of primary keys in one table. Used to
+  // show exactly what each node holds for the records that disagree.
+  rpc GetRowData(ConsistencyRowDataRequest)
+      returns (ConsistencyRowDataResponse);
+
   // ===== CDC STREAMING =====
   // Client-streaming RPC for large CDC payloads (≥128KB)
   // Sends TransactionChunks followed by TransactionCommit
@@ -634,4 +652,79 @@ message LoadDataChunkRequest {
 message LoadDataChunkResponse {
   bytes data = 1;
   uint64 total_size = 2;
+}
+
+// ===== DATA CONSISTENCY MESSAGES =====
+// Read-only, point-in-time best effort: the check hashes local committed
+// rows on each node and never blocks replication. A check run while writes
+// are in flight can report rows as different simply because one node has
+// not applied a commit yet; rerun after quiescence.
+message ConsistencyDigestRequest {
+  uint64 requesting_node_id = 1;
+  string database = 2;  // One database; required.
+}
+
+message ConsistencyColumn {
+  string name = 1;
+  string type = 2;  // Declared SQLite type, "" when untyped.
+}
+
+message ConsistencyTableDigest {
+  string table = 1;
+  // Declared PRIMARY KEY columns in key order. A rowid table with no
+  // declared INTEGER/COMPOUND PRIMARY KEY reports the synthetic column
+  // "__rowid__" (the lookup uses SQLite rowid).
+  repeated string primary_key_columns = 2;
+  // Columns in storage order; two nodes whose signatures differ have
+  // diverged in schema rather than (only) content.
+  repeated ConsistencyColumn columns = 3;
+  uint64 row_count = 4;
+  uint64 hash = 5;  // FNV-1a 64-bit digest of every row in key order
+  bool without_rowid = 6;
+}
+
+message ConsistencyDigestResponse {
+  repeated ConsistencyTableDigest tables = 1;
+}
+
+message ConsistencyRowHashRequest {
+  uint64 requesting_node_id = 1;
+  string database = 2;
+  string table = 3;
+  // Msgpack-encoded primary key tuple strictly after which the page
+  // starts (value from the previous page's next_after_key); empty = first
+  // page.
+  bytes after_key = 4;
+  uint32 limit = 5;  // Rows per page; the server caps it.
+}
+
+message ConsistencyRowHash {
+  bytes key = 1;       // Msgpack-encoded primary key tuple.
+  string key_text = 2; // Human-readable rendering of the same key.
+  uint64 hash = 3;
+}
+
+message ConsistencyRowHashResponse {
+  repeated ConsistencyRowHash rows = 1;
+  bytes next_after_key = 2;
+  bool has_more = 3;
+}
+
+message ConsistencyRowDataRequest {
+  uint64 requesting_node_id = 1;
+  string database = 2;
+  string table = 3;
+  repeated bytes keys = 4;  // Msgpack-encoded primary key tuples.
+}
+
+message ConsistencyRowData {
+  bytes key = 1;
+  bool present = 2;
+  // Column value rendered deterministically: "NULL", "i:<int>", "f:<float>",
+  // "s:<text>", "b:<hex blob>".
+  map<string, string> values = 3;
+}
+
+message ConsistencyRowDataResponse {
+  repeated ConsistencyRowData rows = 1;
 }

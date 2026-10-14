@@ -26,6 +26,10 @@ func RegisterRoutes(mux *http.ServeMux, handlers *AdminHandlers) {
 		r.Get("/health", handlers.handleClusterHealth)
 		r.Get("/autoinc/votes", handlers.handleAutoIncVotes)
 		r.Get("/replication", handlers.handleClusterReplication)
+		// Cluster-wide data consistency check: compares every node's
+		// committed rows per table and reports mismatching records by
+		// node id and primary key.
+		r.Get("/consistency", handlers.handleClusterConsistency)
 		r.Post("/remove/{nodeID}", handlers.handleClusterRemove)
 		r.Post("/allow/{nodeID}", handlers.handleClusterAllow)
 		r.Post("/decommission/{nodeID}", handlers.handleDecommission)
